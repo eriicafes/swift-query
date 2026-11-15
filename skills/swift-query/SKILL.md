@@ -38,12 +38,12 @@ Pick the cache policy:
 
 - `.forever()` for data that only changes when the app says so (call `invalidate()`).
 - `.forever(refreshAfter:)` for data that should refresh periodically but never be dropped.
-- `.swr(staleTime:gcTime:)` for data that may be dropped after going unused. Implement `evict(context:)` to delete only server-owned rows. The default evicts nothing.
+- `.swr(staleTime:gcTime:)` for data that may be dropped after going unused. Expired data is cleaned up automatically at launch, when the app goes to the background, and when it's next used, so don't call `collectGarbage()` from scene-phase handlers. Implement `evict(context:)` to delete only server-owned rows. The default evicts nothing.
 - For a fetcher, `nil` keeps the data in memory for the session only. Don't write rows from such a fetcher unless they hang off a model.
 
 Rows a fetcher writes should hang off a model through a `.cascade` relationship, such as `User.profile`. Give the model and its fetchers a shared tag, such as `"users"`, so evicting the collection invalidates the fetchers. A fetcher that inserts top-level rows must delete them in `evict`.
 
-Always include `QueryRecord.self` in the `ModelContainer` schema. If the app uses CloudKit, add `.queryRecords` to the container's configurations, which keeps `QueryRecord` in a local-only store. Create one provider at the app entry point:
+Always include `QueryRecord.self` in the `ModelContainer` schema. If the app uses CloudKit, give `QueryRecord` its own configuration with a distinct name and `cloudKitDatabase: .none`, for example `ModelConfiguration("SwiftQuery", schema: Schema([QueryRecord.self]), cloudKitDatabase: .none)`. Create one provider at the app entry point:
 
 ```swift
 QueryProvider(

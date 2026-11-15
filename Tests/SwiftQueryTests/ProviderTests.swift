@@ -52,6 +52,7 @@ struct ProviderTests {
     @Test("Garbage collection honors the cache policy of the most recent sync")
     func garbageCollectionUsesLastCache() async throws {
         let (provider, client, server) = try makeProvider()
+        await provider.waitForGarbageCollection() // the launch sweep
         client.sync(.swr(staleTime: .seconds(3600), gcTime: .zero))
         await client.settle()
         #expect(client.data == .init(etag: 1))
@@ -62,10 +63,58 @@ struct ProviderTests {
         #expect(await server.fetchCount == 1)
     }
 
-    @Test("The queryRecords configuration is a local-only store of QueryRecord")
-    func queryRecordsConfiguration() {
-        let configuration = ModelConfiguration.queryRecords
-        #expect(configuration.name == "SwiftQuery")
-        #expect(configuration.schema?.entities.map(\.name) == ["QueryRecord"])
+    @Test("The provider sweeps expired data at launch")
+    func launchSweep() async throws {
+        let container = try makeContainer()
+        let key = QueryRecord.Key.make(TestDetail(id: "1"))
+        let context = ModelContext(container)
+        context.insert(TestProfile(userID: "1", bio: "Ada"))
+        context.insert(QueryRecord(key: key, stateData: Data("{}".utf8), lastSyncedAt: .distantPast, gcTime: 0))
+        try context.save()
+
+        let (provider, _, _) = try makeProvider(container)
+        await provider.waitForGarbageCollection()
+
+        let fresh = ModelContext(container)
+        #expect(try fresh.fetch(QueryRecord.descriptor(key: key)).isEmpty)
+        #expect(try fresh.fetch(FetchDescriptor<TestProfile>()).isEmpty)
+    }
+
+    @Test("A view's scene going to the background sweeps expired data")
+    func backgroundSweep() async throws {
+        let (provider, client, _) = try makeProvider()
+        await provider.waitForGarbageCollection()
+        let key = QueryRecord.Key.make(TestDetail(id: "1"))
+        let context = ModelContext(provider.modelContainer)
+        context.insert(QueryRecord(key: key, stateData: Data("{}".utf8), lastSyncedAt: .distantPast, gcTime: 0))
+        try context.save()
+
+        let subscription = Subscription<ModelFetcher<TestUser>>()
+        subscription.activate(client, cache: nil, phase: .active) { provider.scheduleGarbageCollection() }
+        subscription.activate(client, cache: nil, phase: .background) { provider.scheduleGarbageCollection() }
+        await provider.waitForGarbageCollection()
+
+        #expect(try ModelContext(provider.modelContainer).fetch(QueryRecord.descriptor(key: key)).isEmpty)
+    }
+
+    @Test("A model's stream stops after the keep-alive time; the client is kept")
+    func modelStreamStops() async throws {
+        let (provider, client, server) = try makeProvider(streams: true, keepAliveTime: .zero)
+        do {
+            let subscription = Subscription<ModelFetcher<TestUser>>()
+            subscription.activate(client, cache: nil)
+            await client.settle()
+            await eventually { await server.streamsStarted == 1 }
+            _ = subscription
+        }
+        await eventually { await server.streamsEnded == 1 }
+        #expect(await client.isStreaming() == false)
+
+        // A new view starts it again.
+        let subscription = Subscription<ModelFetcher<TestUser>>()
+        subscription.activate(client, cache: nil)
+        await client.settle()
+        await eventually { await server.streamsStarted == 2 }
+        _ = provider
     }
 }

@@ -26,30 +26,31 @@ import SwiftData
 @MainActor
 public final class QueryProvider {
     public let modelContainer: ModelContainer
-    /// How long an unused fetcher client is kept before it's dropped. Model clients are kept
-    /// for the whole session.
-    public let gracePeriod: Duration
+    /// How long a client is kept after its last view goes away. Then a fetcher client is
+    /// dropped and a model client's stream is stopped; model clients themselves are kept for the
+    /// whole session.
+    public let keepAliveTime: Duration
     /// Orders scoped mutations across every client.
     @ObservationIgnored let mutations = MutationScheduler()
     @ObservationIgnored private var contexts: [ObjectIdentifier: Any] = [:]
     @ObservationIgnored private(set) var entries: [String: FetcherEntry] = [:]
     /// Every live client, held weakly so a client someone still holds is reused, never duplicated.
     @ObservationIgnored private var clients: [AnyHashable: WeakClient] = [:]
-    /// Clients kept alive by the provider: models, clients in use, and idle ones in their grace period.
+    /// Clients kept alive by the provider: models, clients in use, and idle ones in their keep-alive time.
     @ObservationIgnored private var retained: [AnyHashable: any AnyModelQueryClient] = [:]
 
     public init<each Context: Sendable>(
         modelContainer: ModelContainer,
         contexts: repeat each Context,
         fetchers: any Queryable.Type...,
-        gracePeriod: Duration = .seconds(5 * 60)
+        keepAliveTime: Duration = .seconds(5 * 60)
     ) {
         precondition(
             modelContainer.schema.entities.contains { $0.name == String(describing: QueryRecord.self) },
             "QueryProvider requires QueryRecord.self in the ModelContainer schema"
         )
         self.modelContainer = modelContainer
-        self.gracePeriod = gracePeriod
+        self.keepAliveTime = keepAliveTime
         repeat register(each contexts)
         for type in fetchers {
             let entry = FetcherEntry.make(type)
@@ -60,6 +61,8 @@ public final class QueryProvider {
         for entry in entries.values {
             entry.validate(self)
         }
+        // Clean up data that expired since the last launch.
+        scheduleGarbageCollection()
     }
 
     // MARK: Contexts
@@ -131,26 +134,50 @@ public final class QueryProvider {
         if client.isActive {
             retained[id] = client
             client.idleGeneration &+= 1
-        } else if !client.isModel {
+        } else {
             scheduleRelease(id, client)
         }
     }
 
-    /// Keeps an idle client for the grace period, then lets it go unless it was used again.
+    /// Keeps an idle client for the keep-alive time. If it isn't used again, a fetcher client is
+    /// let go (cancelling its stream when it deallocates) and a model client's stream is stopped.
     private func scheduleRelease(_ id: AnyHashable, _ client: any AnyModelQueryClient) {
         retained[id] = client
         client.idleGeneration &+= 1
         let generation = client.idleGeneration
-        let gracePeriod = gracePeriod
+        let keepAliveTime = keepAliveTime
         Task { [weak self, weak client] in
-            try? await Task.sleep(for: gracePeriod)
+            try? await Task.sleep(for: keepAliveTime)
             guard let self, let client,
                   client.idleGeneration == generation, !client.isActive,
                   self.retained[id] === client
             else { return }
-            self.retained[id] = nil
-            self.pruneClients()
+            if client.isModel {
+                client.cancelStream()
+            } else {
+                self.retained[id] = nil
+                self.pruneClients()
+            }
         }
+    }
+
+    // MARK: Garbage collection
+
+    @ObservationIgnored private var garbageCollection: Task<Void, Never>?
+
+    /// Starts a garbage collection sweep unless one is already running. Runs at launch and when
+    /// the app goes to the background.
+    func scheduleGarbageCollection() {
+        guard garbageCollection == nil else { return }
+        garbageCollection = Task { [weak self] in
+            await self?.collectGarbage()
+            self?.garbageCollection = nil
+        }
+    }
+
+    /// Waits for a scheduled sweep to finish.
+    func waitForGarbageCollection() async {
+        await garbageCollection?.value
     }
 
     private func pruneClients() {
@@ -283,6 +310,9 @@ public final class QueryProvider {
     /// Evicts expired SWR caches of live clients that are unobserved and idle, and of every
     /// stored key without a client, using each record's stored cache time. Records of types no
     /// longer listed are deleted without `evict`; `.forever` records are kept.
+    ///
+    /// The provider already runs this at launch and whenever the app goes to the background;
+    /// call it yourself only to clean up at another time.
     public func collectGarbage() async {
         for client in liveClients {
             await client.collectGarbage()

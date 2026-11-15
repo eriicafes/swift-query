@@ -148,13 +148,13 @@ func makeProvider(
     server: FakeServer = FakeServer(),
     saves: Bool = true,
     streams: Bool = false,
-    gracePeriod: Duration = .seconds(300)
+    keepAliveTime: Duration = .seconds(300)
 ) throws -> (QueryProvider, UsersClient, FakeServer) {
     let provider = QueryProvider(
         modelContainer: try container ?? makeContainer(),
         contexts: TestUser.Context(server: server, saves: saves, streams: streams),
         fetchers: TestUser.self, TestDetail.self,
-        gracePeriod: gracePeriod
+        keepAliveTime: keepAliveTime
     )
     return (provider, provider.client(for: TestUser.self), server)
 }

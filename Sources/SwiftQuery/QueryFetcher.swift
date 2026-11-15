@@ -56,8 +56,8 @@ public protocol QueryFetcher: Queryable, Hashable, Codable, Sendable {
     /// scene becomes active) starts a new one. Must not block: do any awaiting inside the
     /// returned task. The stream gets the stored data as `previous` (`nil` before the first
     /// fetch) to resume from, writes rows through its own context from `container`, and
-    /// advances the stored data through `writer`. It is cancelled when its client is dropped or
-    /// its cache is removed.
+    /// advances the stored data through `writer`. It is cancelled once no view has shown the key
+    /// for the provider's `keepAliveTime`, or when its cache is removed.
     func subscribe(
         container: ModelContainer,
         fetchContext: Context,

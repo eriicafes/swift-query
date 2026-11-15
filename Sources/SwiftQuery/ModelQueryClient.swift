@@ -499,6 +499,7 @@ protocol AnyModelQueryClient: AnyObject {
     func resync()
     func refresh() async
     func cancel()
+    func cancelStream()
     func remove() async
     func reset() async
 }

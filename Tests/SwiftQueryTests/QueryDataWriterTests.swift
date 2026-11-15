@@ -71,13 +71,13 @@ struct QueryDataWriterTests {
     func makeFeed(
         _ container: ModelContainer? = nil,
         server: FeedServer = FeedServer(),
-        gracePeriod: Duration = .seconds(300)
+        keepAliveTime: Duration = .seconds(300)
     ) throws -> (QueryProvider, FeedClient, FeedServer) {
         let provider = QueryProvider(
             modelContainer: try container ?? makeContainer(),
             contexts: TestFeed.Context(server: server),
             fetchers: TestFeed.self,
-            gracePeriod: gracePeriod
+            keepAliveTime: keepAliveTime
         )
         return (provider, provider.client(for: TestFeed.self), server)
     }

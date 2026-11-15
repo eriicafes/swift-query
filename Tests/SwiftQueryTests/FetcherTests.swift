@@ -11,13 +11,13 @@ struct FetcherTests {
     func makeRates(
         _ container: ModelContainer? = nil,
         rates: FakeRates = FakeRates(),
-        gracePeriod: Duration = .seconds(300)
+        keepAliveTime: Duration = .seconds(300)
     ) throws -> (QueryProvider, FakeRates) {
         let provider = QueryProvider(
             modelContainer: try container ?? makeContainer(),
             contexts: rates as any RateSource,
             fetchers: TestStoredRate.self,
-            gracePeriod: gracePeriod
+            keepAliveTime: keepAliveTime
         )
         return (provider, rates)
     }
@@ -84,7 +84,7 @@ struct FetcherTests {
 
     @Test("A fetcher without a cache keeps its state in memory only")
     func inMemoryCache() async throws {
-        let (provider, rates) = try makeRates(gracePeriod: .zero)
+        let (provider, rates) = try makeRates(keepAliveTime: .zero)
         do {
             let client = provider.client(for: TestRate(from: "USD", to: "EUR"))
             let subscription = await observe(client)
@@ -104,9 +104,9 @@ struct FetcherTests {
 
     // MARK: Client lifetime
 
-    @Test("Unused fetcher clients are dropped after the grace period; models are kept")
+    @Test("Unused fetcher clients are dropped after the keep-alive time; models are kept")
     func clientLifetime() async throws {
-        let (provider, _, _) = try makeProvider(gracePeriod: .zero)
+        let (provider, _, _) = try makeProvider(keepAliveTime: .zero)
         weak var detail: DetailClient?
         weak var users: UsersClient?
         do {
@@ -119,7 +119,7 @@ struct FetcherTests {
 
     @Test("A client someone still holds is reused, never duplicated")
     func heldClientReused() async throws {
-        let (provider, _, _) = try makeProvider(gracePeriod: .zero)
+        let (provider, _, _) = try makeProvider(keepAliveTime: .zero)
         let held = provider.client(for: TestDetail(id: "1"))
         for _ in 0..<10 { await Task.yield() }
         #expect(provider.client(for: TestDetail(id: "1")) === held)
@@ -127,7 +127,7 @@ struct FetcherTests {
 
     @Test("Dropping a client cancels its stream")
     func dropCancelsStream() async throws {
-        let (provider, _, server) = try makeProvider(streams: true, gracePeriod: .zero)
+        let (provider, _, server) = try makeProvider(streams: true, keepAliveTime: .zero)
         weak var weakClient: DetailClient?
         do {
             let client = provider.client(for: TestDetail(id: "1"))
@@ -186,7 +186,7 @@ struct FetcherTests {
 
     @Test("Garbage collection evicts expired stored keys and invalidates shared tags")
     func sweepStoredKeys() async throws {
-        let (provider, _, _) = try makeProvider(gracePeriod: .zero)
+        let (provider, _, _) = try makeProvider(keepAliveTime: .zero)
         do {
             await provider.client(for: TestDetail(id: "1")).refresh()
             await provider.client(for: TestDetail(id: "2")).refresh()
@@ -328,7 +328,7 @@ struct FetcherTests {
 
     @Test("refetch with includeStored fetches stored keys that have no client")
     func refetchStored() async throws {
-        let (provider, _, server) = try makeProvider(gracePeriod: .zero)
+        let (provider, _, server) = try makeProvider(keepAliveTime: .zero)
         do {
             await provider.client(for: TestDetail(id: "1")).refresh()
         }

@@ -5,15 +5,15 @@ import SwiftData
 ///
 /// Include `QueryRecord.self` in your `ModelContainer` schema. The model is CloudKit-compatible
 /// (no unique constraints, every property has a default), but sync metadata describes one
-/// device's local data, so keep it in its own local-only store when the app uses CloudKit, with
-/// ``SwiftData/ModelConfiguration/queryRecords``:
+/// device's local data. When the app uses CloudKit, give it its own configuration that doesn't
+/// sync, with a name distinct from your other configurations so it gets its own store file:
 ///
 /// ```swift
 /// let container = try ModelContainer(
 ///     for: Schema([User.self, QueryRecord.self]),
 ///     configurations:
 ///         ModelConfiguration(schema: Schema([User.self]), cloudKitDatabase: .automatic),
-///         .queryRecords
+///         ModelConfiguration("SwiftQuery", schema: Schema([QueryRecord.self]), cloudKitDatabase: .none)
 /// )
 /// ```
 @Model
@@ -128,16 +128,5 @@ extension QueryRecord {
         static func unescape(_ tag: String) -> String {
             tag.replacingOccurrences(of: "%2C", with: ",").replacingOccurrences(of: "%25", with: "%")
         }
-    }
-}
-
-extension ModelConfiguration {
-    /// A local-only configuration holding just ``QueryRecord``, for apps whose other models sync
-    /// with CloudKit.
-    ///
-    /// Its store is named "SwiftQuery" so it never shares a file with the app's own
-    /// configurations, and it never syncs: sync metadata describes one device's local data.
-    public static var queryRecords: ModelConfiguration {
-        ModelConfiguration("SwiftQuery", schema: Schema([QueryRecord.self]), cloudKitDatabase: .none)
     }
 }

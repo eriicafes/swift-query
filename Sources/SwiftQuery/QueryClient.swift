@@ -45,7 +45,9 @@ public struct QueryClient<Fetcher: QueryFetcher>: DynamicProperty {
         let cache = cache
         let scenePhase = scenePhase
         MainActor.assumeIsolated {
-            subscription.activate(provider.client(for: fetcher), cache: cache, phase: scenePhase)
+            subscription.activate(provider.client(for: fetcher), cache: cache, phase: scenePhase) {
+                provider.scheduleGarbageCollection()
+            }
         }
     }
 }
@@ -59,8 +61,16 @@ final class Subscription<Fetcher: QueryFetcher> {
 
     nonisolated init() {}
 
-    func activate(_ client: ModelQueryClient<Fetcher>, cache: QueryCache?, phase: ScenePhase = .active) {
+    func activate(
+        _ client: ModelQueryClient<Fetcher>,
+        cache: QueryCache?,
+        phase: ScenePhase = .active,
+        onBackground: (@MainActor () -> Void)? = nil
+    ) {
         defer { self.phase = phase }
+        if phase == .background, let previous = self.phase, previous != .background {
+            onBackground?()
+        }
         guard self.client === client else {
             self.client?.detach()
             self.client = client
