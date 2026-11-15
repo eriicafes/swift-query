@@ -3,7 +3,7 @@ import SwiftData
 import Testing
 @testable import SwiftQuery
 
-/// A feed whose stream hands its writer to the server.
+/// A feed whose subscription hands its writer to the server.
 actor FeedServer {
     /// Holds fetches in flight until a test releases them. Key: "fetch".
     nonisolated let checkpoints = Checkpoints()
@@ -82,7 +82,7 @@ struct QueryDataWriterTests {
         return (provider, provider.client(for: TestFeed.self), server)
     }
 
-    /// Attaches a view, which syncs the feed and starts its stream, then returns the stream's writer.
+    /// Attaches a view, which syncs the feed and subscribes, then returns the subscription's writer.
     func connect(
         _ client: FeedClient,
         _ server: FeedServer
@@ -94,7 +94,7 @@ struct QueryDataWriterTests {
         return (try #require(await server.writer), subscription)
     }
 
-    @Test("Stream writes are saved and published")
+    @Test("Subscription writes are saved and published")
     func persistsAndPublishes() async throws {
         let container = try makeContainer()
         let server = FeedServer()

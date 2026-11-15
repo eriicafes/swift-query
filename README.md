@@ -1,17 +1,8 @@
 # SwiftQuery
 
-`swift-query` is a sync and caching layer for SwiftData, inspired by React Query. It fetches data from your API into SwiftData, keeps it fresh, streams live updates, and applies optimistic mutations.
+`swift-query` is a sync and caching layer for SwiftData, inspired by React Query. It fetches remote data into SwiftData, keeps it fresh, subscribes to live updates, and applies optimistic mutations.
 
 SwiftData stays the source of truth. Your views keep reading data with SwiftData's `@Query`, and SwiftQuery's `@QueryClient` keeps that data in sync with the server.
-
-## Features
-
-- Sync whole collections, single rows, related models, or standalone values
-- One shared, deduplicated fetch per piece of data
-- Stale-while-revalidate caching that survives app launches
-- Live streams that run while a view is on screen
-- Invalidation by key, type or tag
-- Optimistic mutations with rollback and ordered scopes
 
 ## Requirements
 
@@ -152,7 +143,7 @@ struct PostsView: View {
 
 ## Fetch Dependencies
 
-A fetch usually needs something to talk to the server, such as an API client or a URL session. You pass these to the provider in `contexts:`, and each fetch receives the one whose type matches its `fetchContext` parameter.
+A fetch usually has dependencies, such as a URL session, a socket, credentials or settings. You pass them to the provider in `contexts:`, and each fetch receives the one whose type matches its `fetchContext` parameter.
 
 ```swift
 struct API: Sendable {
@@ -506,9 +497,9 @@ try await postsClient.mutate(scope: "post-\(id)") {
 }
 ```
 
-## Streams
+## Subscribe
 
-Some data arrives continuously, such as chat messages over a socket. Implement `subscribe` to keep a stream open while a view shows the data:
+Some data arrives continuously, such as chat messages over a socket. Implement `subscribe` to keep receiving updates while a view shows the data. It returns a task that runs until it's cancelled:
 
 ```swift
 extension Message: QueryModel {
@@ -534,17 +525,35 @@ extension Message: QueryModel {
 }
 ```
 
-- The stream starts when a view shows the data, and stops a few minutes after the last such view goes away. The delay is 5 minutes by default; change it with the provider's `keepAliveTime:` argument.
+- `subscribe` is called when a view shows the data. Its task is cancelled a few minutes after the last such view goes away. The delay is 5 minutes by default; change it with the provider's `keepAliveTime:` argument.
 - `subscribe` should only create and return the task. Do any waiting inside it.
-- `writer.update` changes the saved query data, so the next `fetch` continues after the last streamed message instead of downloading it again.
+- `writer.update` changes the saved query data, so the next `fetch` continues after the last update the task received instead of downloading it again.
 
 ## Concurrency
 
-`fetch` and `subscribe` run in the background, off the main actor, so downloading and saving don't block your UI. If your app target uses main-actor default isolation, mark the conformance `nonisolated`:
+`fetch` and the task returned by `subscribe` run in the background, off the main actor. Waiting for the network doesn't block the UI either way, but the work around it would: decoding a large response, creating and updating many models, and saving them to the store. Running in the background keeps that work from causing dropped frames.
+
+Each fetch gets its own `ModelContext`, and the task returned by `subscribe` creates its own from `container`. SwiftData requires a context to be used from one place at a time, and these never leave their `fetch` or task. Saving them updates the main context, so `@Query` sees the changes.
+
+### Main-actor default isolation
+
+In a Swift 6.2 app target that uses main-actor default isolation, as new Xcode projects do, everything you declare runs on the main actor unless you say otherwise. Two things need `nonisolated`.
+
+The conformance, or the code won't compile:
 
 ```swift
 nonisolated extension Post: QueryModel { ... }
 ```
+
+The types your `fetch` calls into, such as the ones in your fetch context, or their work moves back to the main thread:
+
+```swift
+nonisolated struct API: Sendable {
+    func posts() async throws -> [PostDTO] { ... }
+}
+```
+
+Without the second one, everything still compiles and works, but each call from `fetch` hops to the main actor to run, so work such as decoding happens on the main thread. You won't notice it with small responses, but large ones will stall scrolling and taps.
 
 ## Example
 

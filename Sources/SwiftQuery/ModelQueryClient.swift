@@ -126,9 +126,10 @@ public final class ModelQueryClient<Fetcher: QueryFetcher> {
         enqueue { await $0.cancelFetch() }
     }
 
-    /// Cancels the stream started by `subscribe`, if any. The next sync from a view starts a new one.
-    public func cancelStream() {
-        enqueue { await $0.cancelStream() }
+    /// Cancels the task returned by `subscribe`, if any. The next sync from a view calls
+    /// `subscribe` again.
+    public func unsubscribe() {
+        enqueue { await $0.cancelSubscription() }
     }
 
     // MARK: Mutations
@@ -373,8 +374,8 @@ public final class ModelQueryClient<Fetcher: QueryFetcher> {
         await actor.reset()
     }
 
-    func isStreaming() async -> Bool {
-        await actor.isStreaming
+    func isSubscribed() async -> Bool {
+        await actor.isSubscribed
     }
 
     func subscriptions() async -> Int {
@@ -499,7 +500,7 @@ protocol AnyModelQueryClient: AnyObject {
     func resync()
     func refresh() async
     func cancel()
-    func cancelStream()
+    func unsubscribe()
     func remove() async
     func reset() async
 }

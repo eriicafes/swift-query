@@ -12,4 +12,4 @@
 - 89adb15: Added `QueryProvider`
 - 89adb15: Added `@QueryClient` and `ModelQueryClient` with `QueryState`
 - 89adb15: Added persisted sync metadata with `QueryRecord`
-- 89adb15: Added streams with `QueryDataWriter`
+- 89adb15: Added live updates with `subscribe` and `QueryDataWriter`

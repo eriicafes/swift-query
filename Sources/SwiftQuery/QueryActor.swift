@@ -53,15 +53,15 @@ actor QueryActor<Fetcher: QueryFetcher> {
     /// How many fetch requests joined an in-flight fetch instead of starting one.
     private(set) var fetchJoins = 0
     private var invalidations: UInt64 = 0
-    private var streamTask: Task<Void, Never>?
-    private var streamID: UInt64 = 0
-    /// How many times `subscribe` returned a stream.
+    private var subscriptionTask: Task<Void, Never>?
+    private var subscriptionID: UInt64 = 0
+    /// How many times `subscribe` returned a task.
     private(set) var subscriptions = 0
     private var observers = 0
     /// The cache policy of the most recent sync, used by garbage collection so per-view
     /// overrides such as `.swr(gcTime:)` are honored.
     private var lastCache: QueryCache?
-    /// Stream writes received while a fetch is in flight, applied after it finishes.
+    /// Writes from the subscription task received while a fetch is in flight, applied after it finishes.
     private var pendingWrites: [Write] = []
     /// Most writes kept behind one fetch. Beyond this they are saved to the stored state right
     /// away, so a fetch that never finishes can't grow the queue without bound.
@@ -91,7 +91,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
     }
 
     deinit {
-        streamTask?.cancel()
+        subscriptionTask?.cancel()
     }
 
     private var defaultCache: QueryCache { fetcher.cache ?? .forever() }
@@ -117,7 +117,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
 
     // MARK: Operations
 
-    /// Starts observing the key: syncs it and starts its stream if none is running.
+    /// Starts observing the key: syncs it and calls `subscribe` if no subscription task is running.
     /// Expiry is only checked when the key was unobserved.
     func attach(_ cache: QueryCache) async {
         let wasUnobserved = observers == 0
@@ -241,7 +241,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
         inFlight?.task.cancel()
     }
 
-    /// Cancels any fetch and stream, then evicts the key's data and clears its state.
+    /// Cancels any fetch and subscription task, then evicts the key's data and clears its state.
     func remove() async {
         loadIfNeeded()
         inFlight?.task.cancel()
@@ -280,14 +280,14 @@ actor QueryActor<Fetcher: QueryFetcher> {
         }
     }
 
-    /// Cancels the running stream. The next sync from a view starts a new one.
-    func cancelStream() {
-        streamTask?.cancel()
-        streamTask = nil
-        streamID &+= 1
+    /// Cancels the subscription task. The next sync from a view calls `subscribe` again.
+    func cancelSubscription() {
+        subscriptionTask?.cancel()
+        subscriptionTask = nil
+        subscriptionID &+= 1
     }
 
-    /// Applies a stream write now, or queues it behind the in-flight fetch.
+    /// Applies a write from the subscription task now, or queues it behind the in-flight fetch.
     func write(_ body: @escaping Write) async {
         if inFlight != nil {
             pendingWrites.append(body)
@@ -309,8 +309,8 @@ actor QueryActor<Fetcher: QueryFetcher> {
         await lastFetch?.value
     }
 
-    /// Whether a stream is running.
-    var isStreaming: Bool { streamTask != nil }
+    /// Whether a subscription task is running.
+    var isSubscribed: Bool { subscriptionTask != nil }
 
     // MARK: Sync
 
@@ -383,7 +383,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
             )
             // A fetch cancelled while running may still return; don't save its state.
             try Task.checkCancellation()
-            // Stream progress made during the fetch goes on top of the fetched state.
+            // Updates the subscription task made during the fetch go on top of the fetched state.
             let applied = pendingWrites
             pendingWrites = []
             let data = Self.applying(applied, to: fetchedData) ?? fetchedData
@@ -451,9 +451,9 @@ actor QueryActor<Fetcher: QueryFetcher> {
         }
     }
 
-    /// Starts the stream if the key has one and none is running.
+    /// Calls `subscribe` if no subscription task is running, and keeps the task it returns.
     private func ensureSubscribed() {
-        guard streamTask == nil else { return }
+        guard subscriptionTask == nil else { return }
         let storedData = (try? record().stateData).flatMap { Self.isDecodable($0) ? $0 : nil }
         guard let task = Self.runSubscribe(
             fetcher: fetcher,
@@ -463,20 +463,20 @@ actor QueryActor<Fetcher: QueryFetcher> {
             writer: writer
         ) else { return }
         subscriptions += 1
-        streamID &+= 1
-        let id = streamID
-        streamTask = task
-        // Forget the stream once it ends on its own, so the next sync from a view restarts it.
-        // Weak, so a running stream doesn't keep this actor (which cancels it on deinit) alive.
+        subscriptionID &+= 1
+        let id = subscriptionID
+        subscriptionTask = task
+        // Forget the task once it ends on its own, so the next sync from a view subscribes again.
+        // Weak, so a running task doesn't keep this actor (which cancels it on deinit) alive.
         Task { [weak self] in
             await task.value
-            await self?.streamEnded(id)
+            await self?.subscriptionEnded(id)
         }
     }
 
-    private func streamEnded(_ id: UInt64) {
-        if streamID == id {
-            streamTask = nil
+    private func subscriptionEnded(_ id: UInt64) {
+        if subscriptionID == id {
+            subscriptionTask = nil
         }
     }
 
@@ -525,7 +525,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
     /// Clears the key's metadata first, then evicts its data: if evicting fails, the data stays
     /// and the next sync refetches it, instead of empty data being treated as fresh.
     private func evict(_ record: QueryRecord) throws {
-        cancelStream()
+        cancelSubscription()
         clear(record)
         try save()
         status = .pending

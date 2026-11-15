@@ -30,10 +30,10 @@ public protocol QueryModel: PersistentModel, Queryable {
     /// Tags for invalidating and removing groups of keys. Defaults to none.
     static var tags: Set<String> { get }
 
-    /// Fetches the collection into `context`. See ``QueryFetcher/fetch(context:fetchContext:state:)``.
+    /// Fetches the collection into `context`. See ``QueryFetcher/fetch(context:fetchContext:previous:)``.
     static func fetch(context: ModelContext, fetchContext: Context, previous: QueryData?) async throws -> QueryData
 
-    /// Starts a long-lived stream. See ``QueryFetcher/subscribe(container:fetchContext:state:writer:)``.
+    /// Subscribes to live updates. See ``QueryFetcher/subscribe(container:fetchContext:previous:writer:)``.
     static func subscribe(
         container: ModelContainer,
         fetchContext: Context,

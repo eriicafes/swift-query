@@ -49,15 +49,16 @@ public protocol QueryFetcher: Queryable, Hashable, Codable, Sendable {
     /// cancellation in long work.
     func fetch(context: ModelContext, fetchContext: Context, previous: QueryData?) async throws -> QueryData
 
-    /// Starts a long-lived stream, such as a socket subscription, or returns `nil` (the default).
+    /// Subscribes to live updates, such as messages from a socket, by returning a task that runs
+    /// until it's cancelled. Returns `nil` by default, for keys with no live updates.
     ///
-    /// Called when the client gains a view and no stream is running. A stream that ends on its
-    /// own is not restarted right away; the next sync from a view (when one appears or its
-    /// scene becomes active) starts a new one. Must not block: do any awaiting inside the
-    /// returned task. The stream gets the stored data as `previous` (`nil` before the first
-    /// fetch) to resume from, writes rows through its own context from `container`, and
-    /// advances the stored data through `writer`. It is cancelled once no view has shown the key
-    /// for the provider's `keepAliveTime`, or when its cache is removed.
+    /// Called when the client gains a view and no subscription task is running. A task that ends
+    /// on its own is not restarted right away; the next sync from a view (when one appears or its
+    /// scene becomes active) calls `subscribe` again. Must not block: do any awaiting inside the
+    /// returned task. The task gets the stored data as `previous` (`nil` before the first fetch)
+    /// to resume from, writes rows through its own context from `container`, and advances the
+    /// stored data through `writer`. It is cancelled once no view has shown the key for the
+    /// provider's `keepAliveTime`, or when its cache is removed.
     func subscribe(
         container: ModelContainer,
         fetchContext: Context,
@@ -90,19 +91,19 @@ public protocol DefaultFetchContext: Sendable {
     init()
 }
 
-/// Updates a key's persisted ``QueryFetcher/QueryData`` from its stream.
+/// Updates a key's persisted ``QueryFetcher/QueryData`` from the task returned by `subscribe`.
 ///
 /// Passed to `subscribe`. Updates run in order on the key's query actor and are saved immediately:
 ///
 /// - While a fetch is in flight, updates are queued and applied on top of that fetch's result,
-///   so stream progress isn't lost to an older pull.
+///   so updates received during the fetch aren't lost to an older pull.
 /// - Events that arrive during a fetch may also be in its response, so make updates monotonic,
 ///   for example `state.seq = max(state.seq, event.seq)`.
 /// - If 1,000 updates queue up behind one fetch, they are saved to the stored state right away
 ///   instead. That fetch's result then replaces them, so those events may be pulled again.
 /// - Updates are dropped when nothing has synced successfully yet, and once the client is gone.
 ///
-/// Stream updates never change `lastSyncedAt`, so they don't affect freshness.
+/// These updates never change `lastSyncedAt`, so they don't affect freshness.
 public struct QueryDataWriter<QueryData>: Sendable {
     private let apply: @Sendable (@escaping @Sendable (inout QueryData) -> Void) async -> Void
 

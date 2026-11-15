@@ -1,6 +1,6 @@
 ---
 name: swift-query
-description: Use when syncing SwiftData or other remote data with external APIs using SwiftQuery. Covers QueryModel, QueryFetcher, Context, QueryData, QueryCache, QueryProvider contexts and fetchers, @QueryClient, ModelQueryClient, subscribe streams and QueryDataWriter, invalidation and other bulk operations, query/getQueryState/getQueryData/setQueryData, and optimistic mutations.
+description: Use when syncing SwiftData or other remote data with external APIs using SwiftQuery. Covers QueryModel, QueryFetcher, Context, QueryData, QueryCache, QueryProvider contexts and fetchers, @QueryClient, ModelQueryClient, subscribe and QueryDataWriter, invalidation and other bulk operations, query/getQueryState/getQueryData/setQueryData, and optimistic mutations.
 ---
 
 # SwiftQuery
@@ -12,7 +12,7 @@ Use this skill when the user wants to:
 - fetch remote data into SwiftData models and keep it fresh
 - fetch a single row, extra data attached to rows, or a standalone value with no model of its own
 - set up a `QueryProvider` and use `@QueryClient` in views
-- add pull-to-refresh, invalidation, streams, or optimistic mutations
+- add pull-to-refresh, invalidation, live updates with `subscribe`, or optimistic mutations
 
 ## Core Guidance
 
@@ -30,9 +30,9 @@ In `fetch`:
 - Write rows into the provided `context`. The context is fresh per fetch. Pending changes are saved when `fetch` returns, and discarded if it throws.
 - Read cursors or ETags from `previous?` and return the new data. It is saved once, after `fetch` returns successfully. On a 304, return `previous`.
 - On a 304 or other "no changes" response, don't touch rows.
-- If the app uses MainActor default isolation, mark the conformance extension `nonisolated`.
+- If the app uses MainActor default isolation, mark the conformance extension `nonisolated`, and make the types `fetch` calls into (such as those in its fetch context) `nonisolated` too. Otherwise each call hops back to the main actor and does its work there.
 
-Implement `subscribe` only when the key needs a long-lived stream, such as a socket. It must return a task without awaiting anything itself, create its own `ModelContext(container)`, and call `await writer.update { data in ... }` with monotonic changes such as `data.seq = max(data.seq, event.seq)`. Don't deduplicate connections yourself: the client runs at most one stream and only while a view shows the key.
+Implement `subscribe` only when the key needs live updates, such as from a socket. It must return a task without awaiting anything itself, create its own `ModelContext(container)`, and call `await writer.update { data in ... }` with monotonic changes such as `data.seq = max(data.seq, event.seq)`. Don't deduplicate connections yourself: the client runs at most one `subscribe` task, and only while a view shows the key.
 
 Pick the cache policy:
 

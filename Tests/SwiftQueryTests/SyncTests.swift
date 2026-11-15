@@ -176,11 +176,11 @@ struct SyncTests {
         #expect(await server.requestedEtags == [nil, 1])
     }
 
-    @Test("A view starts the stream once; fetches alone never do")
+    @Test("A view subscribes once; fetches alone never do")
     func subscribeOnAttach() async throws {
-        let (_, client, server) = try makeProvider(streams: true)
+        let (_, client, server) = try makeProvider(subscribes: true)
         await client.refresh()
-        #expect(await server.streamsStarted == 0)
+        #expect(await server.subscriptionsStarted == 0)
 
         let first = Subscription<ModelFetcher<TestUser>>()
         let second = Subscription<ModelFetcher<TestUser>>()
@@ -188,28 +188,28 @@ struct SyncTests {
         second.activate(client, cache: nil)
         await client.settle()
         await client.refresh()
-        await eventually { await server.streamsStarted == 1 }
+        await eventually { await server.subscriptionsStarted == 1 }
         #expect(await client.subscriptions() == 1)
     }
 
-    @Test("A cancelled stream restarts on the next sync from a view")
-    func streamRestarts() async throws {
-        let (_, client, server) = try makeProvider(streams: true)
+    @Test("A cancelled subscription restarts on the next sync from a view")
+    func subscriptionRestarts() async throws {
+        let (_, client, server) = try makeProvider(subscribes: true)
         let subscription = Subscription<ModelFetcher<TestUser>>()
         subscription.activate(client, cache: nil)
         await client.settle()
-        await eventually { await server.streamsStarted == 1 }
+        await eventually { await server.subscriptionsStarted == 1 }
 
-        client.cancelStream()
+        client.unsubscribe()
         await client.settleOperations()
-        await eventually { await server.streamsEnded == 1 }
-        #expect(await client.isStreaming() == false)
+        await eventually { await server.subscriptionsEnded == 1 }
+        #expect(await client.isSubscribed() == false)
 
-        // The scene becoming active again syncs, which restarts the stream.
+        // The scene becoming active again syncs, which subscribes again.
         subscription.activate(client, cache: nil, phase: .background)
         subscription.activate(client, cache: nil, phase: .active)
         await client.settle()
-        await eventually { await server.streamsStarted == 2 }
+        await eventually { await server.subscriptionsStarted == 2 }
     }
 
     @Test("Expired SWR cache is evicted and refetched from default state")

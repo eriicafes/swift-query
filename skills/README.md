@@ -12,4 +12,4 @@ npx skills add eriicafes/swift-query
 
 | Skill | Description |
 |---|---|
-| [`swift-query`](./swift-query/SKILL.md) | Query models, cache policies, providers, query clients, streams, and optimistic mutations for SwiftQuery |
+| [`swift-query`](./swift-query/SKILL.md) | Query models and fetchers, cache policies, providers, query clients, live updates with `subscribe`, and optimistic mutations for SwiftQuery |

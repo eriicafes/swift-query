@@ -14,9 +14,9 @@ actor FakeServer {
     private(set) var users: [String: String]
     private(set) var fetchCount = 0
     private(set) var requestedEtags: [Int?] = []
-    /// How many streams started and how many ended (by cancellation).
-    private(set) var streamsStarted = 0
-    private(set) var streamsEnded = 0
+    /// How many subscriptions started and how many ended (by cancellation).
+    private(set) var subscriptionsStarted = 0
+    private(set) var subscriptionsEnded = 0
     /// "start:<name>" and "end:<name>" for each rename, in order.
     private(set) var renameLog: [String] = []
     private var etag = 0
@@ -39,19 +39,19 @@ actor FakeServer {
         return (snapshot, etag)
     }
 
-    /// A stream that stays open until its task is cancelled.
-    func stream() async {
-        streamsStarted += 1
+    /// A subscription that stays open until its task is cancelled.
+    func subscription() async {
+        subscriptionsStarted += 1
         while !Task.isCancelled {
             try? await Task.sleep(for: .seconds(3600))
         }
-        streamsEnded += 1
+        subscriptionsEnded += 1
     }
 
-    /// A stream that ends on its own right away.
-    func shortStream() {
-        streamsStarted += 1
-        streamsEnded += 1
+    /// A subscription that ends on its own right away.
+    func shortSubscription() {
+        subscriptionsStarted += 1
+        subscriptionsEnded += 1
     }
 
     func rename(id: String, to name: String, fail: Bool = false) async throws -> String {
@@ -80,7 +80,7 @@ extension TestUser: QueryModel {
     struct Context: Sendable {
         let server: FakeServer
         var saves = true
-        var streams = false
+        var subscribes = false
     }
 
     struct QueryData: Codable, Equatable {
@@ -111,9 +111,9 @@ extension TestUser: QueryModel {
         previous: QueryData?,
         writer: QueryDataWriter<QueryData>
     ) -> Task<Void, Never>? {
-        guard fetchContext.streams else { return nil }
+        guard fetchContext.subscribes else { return nil }
         let server = fetchContext.server
-        return Task { await server.stream() }
+        return Task { await server.subscription() }
     }
 
     static func evict(context: ModelContext) throws {
@@ -147,12 +147,12 @@ func makeProvider(
     _ container: ModelContainer? = nil,
     server: FakeServer = FakeServer(),
     saves: Bool = true,
-    streams: Bool = false,
+    subscribes: Bool = false,
     keepAliveTime: Duration = .seconds(300)
 ) throws -> (QueryProvider, UsersClient, FakeServer) {
     let provider = QueryProvider(
         modelContainer: try container ?? makeContainer(),
-        contexts: TestUser.Context(server: server, saves: saves, streams: streams),
+        contexts: TestUser.Context(server: server, saves: saves, subscribes: subscribes),
         fetchers: TestUser.self, TestDetail.self,
         keepAliveTime: keepAliveTime
     )
@@ -303,9 +303,9 @@ struct TestDetail: QueryFetcher {
         previous: QueryData?,
         writer: QueryDataWriter<QueryData>
     ) -> Task<Void, Never>? {
-        guard fetchContext.streams else { return nil }
+        guard fetchContext.subscribes else { return nil }
         let server = fetchContext.server
-        return Task { await server.stream() }
+        return Task { await server.subscription() }
     }
 
     func evict(context: ModelContext) throws {

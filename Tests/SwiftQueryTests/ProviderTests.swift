@@ -97,24 +97,24 @@ struct ProviderTests {
         #expect(try ModelContext(provider.modelContainer).fetch(QueryRecord.descriptor(key: key)).isEmpty)
     }
 
-    @Test("A model's stream stops after the keep-alive time; the client is kept")
-    func modelStreamStops() async throws {
-        let (provider, client, server) = try makeProvider(streams: true, keepAliveTime: .zero)
+    @Test("A model's subscription is cancelled after the keep-alive time; the client is kept")
+    func modelSubscriptionStops() async throws {
+        let (provider, client, server) = try makeProvider(subscribes: true, keepAliveTime: .zero)
         do {
             let subscription = Subscription<ModelFetcher<TestUser>>()
             subscription.activate(client, cache: nil)
             await client.settle()
-            await eventually { await server.streamsStarted == 1 }
+            await eventually { await server.subscriptionsStarted == 1 }
             _ = subscription
         }
-        await eventually { await server.streamsEnded == 1 }
-        #expect(await client.isStreaming() == false)
+        await eventually { await server.subscriptionsEnded == 1 }
+        #expect(await client.isSubscribed() == false)
 
         // A new view starts it again.
         let subscription = Subscription<ModelFetcher<TestUser>>()
         subscription.activate(client, cache: nil)
         await client.settle()
-        await eventually { await server.streamsStarted == 2 }
+        await eventually { await server.subscriptionsStarted == 2 }
         _ = provider
     }
 }

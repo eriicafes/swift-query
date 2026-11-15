@@ -125,19 +125,19 @@ struct FetcherTests {
         #expect(provider.client(for: TestDetail(id: "1")) === held)
     }
 
-    @Test("Dropping a client cancels its stream")
-    func dropCancelsStream() async throws {
-        let (provider, _, server) = try makeProvider(streams: true, keepAliveTime: .zero)
+    @Test("Dropping a client cancels its subscription")
+    func dropCancelsSubscription() async throws {
+        let (provider, _, server) = try makeProvider(subscribes: true, keepAliveTime: .zero)
         weak var weakClient: DetailClient?
         do {
             let client = provider.client(for: TestDetail(id: "1"))
             weakClient = client
             let subscription = await observe(client)
-            await eventually { await server.streamsStarted == 1 }
+            await eventually { await server.subscriptionsStarted == 1 }
             _ = subscription
         }
         await eventually { weakClient == nil }
-        await eventually { await server.streamsEnded == 1 }
+        await eventually { await server.subscriptionsEnded == 1 }
     }
 
     // MARK: Invalidation

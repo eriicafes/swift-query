@@ -27,8 +27,8 @@ import SwiftData
 public final class QueryProvider {
     public let modelContainer: ModelContainer
     /// How long a client is kept after its last view goes away. Then a fetcher client is
-    /// dropped and a model client's stream is stopped; model clients themselves are kept for the
-    /// whole session.
+    /// dropped and a model client's subscription task is cancelled; model clients themselves are
+    /// kept for the whole session.
     public let keepAliveTime: Duration
     /// Orders scoped mutations across every client.
     @ObservationIgnored let mutations = MutationScheduler()
@@ -140,7 +140,8 @@ public final class QueryProvider {
     }
 
     /// Keeps an idle client for the keep-alive time. If it isn't used again, a fetcher client is
-    /// let go (cancelling its stream when it deallocates) and a model client's stream is stopped.
+    /// let go (cancelling its subscription task when it deallocates) and a model client's
+    /// subscription task is cancelled.
     private func scheduleRelease(_ id: AnyHashable, _ client: any AnyModelQueryClient) {
         retained[id] = client
         client.idleGeneration &+= 1
@@ -153,7 +154,7 @@ public final class QueryProvider {
                   self.retained[id] === client
             else { return }
             if client.isModel {
-                client.cancelStream()
+                client.unsubscribe()
             } else {
                 self.retained[id] = nil
                 self.pruneClients()

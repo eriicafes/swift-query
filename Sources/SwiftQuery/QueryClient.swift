@@ -11,7 +11,7 @@ import SwiftUI
 ///
 /// The client comes from the environment's ``QueryProvider``, which creates it on first use.
 /// A sync is requested when the view appears and again whenever its scene becomes active, not on
-/// every body evaluation; the key's stream starts if it has one. The cache override applies
+/// every body evaluation, and `subscribe` is called if the key has live updates. The cache override applies
 /// only to this view's requests. While the view is alive the key counts as in use: its client is
 /// kept and its cache isn't garbage collected.
 @propertyWrapper
