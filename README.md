@@ -6,10 +6,12 @@ SwiftData stays the source of truth for application data. SwiftQuery only manage
 
 ## Features
 
-- Shared, deduplicated fetches per model type
-- `forever` and stale-while-revalidate cache policies
+- Sync whole SwiftData collections, single rows, extra data attached to rows, or data that never touches SwiftData
+- Shared, deduplicated fetches per key, with clients created on first use
+- `forever` and stale-while-revalidate cache policies, or in-memory state for the session
 - Sync metadata (ETags, cursors) persisted across launches
-- Long-lived stream tasks managed alongside fetches, with opt-in sync state updates
+- Streams that start while a view shows the data and can advance the sync state
+- Invalidate, refetch, cancel, remove and reset by key, type or tag
 - Optimistic mutations with manual rollback, and scopes that keep related mutations in order
 
 ## Requirements
@@ -54,22 +56,20 @@ npx skills add eriicafes/swift-query
 
 | Component | Responsibility |
 |---|---|
-| `QueryModel` | Defines how a model fetches and synchronizes external data |
-| `SyncedModel` | The base of `QueryModel`; conform to it directly when a stream should update sync state |
-| `SyncStateWriter` | Lets a `SyncedModel`'s stream task update its sync state |
-| `QueryProvider` | Registers model types and their dependencies; owns one client per type |
-| `QueryProvider.Model` | Typed registration holding a model's `SyncContext` |
-| `@QueryClient` | Connects a view to the shared client and requests sync |
-| `ModelQueryClient` | Observable client exposing state and operations |
-| `ModelQueryActor` | Serializes sync, deduplicates fetches, manages persisted metadata (internal) |
-| `QueryRecord` | Persists sync metadata across launches |
+| `QueryModel` | Syncs a whole SwiftData collection; the model type is the key |
+| `QueryFetcher` | Syncs anything else; each fetcher value is its own key |
+| `StateWriter` | Lets a stream update its key's sync state |
+| `QueryProvider` | Resolves dependencies, creates one client per key, sweeps caches, runs bulk operations |
+| `@QueryClient` | Connects a view to a key's client and keeps it in sync |
+| `ModelQueryClient` | Observable client exposing state and operations for one key |
+| `QueryRecord` | Persists sync state and metadata across launches |
 | `@Query` | Reads application data directly from SwiftData |
 
 ## Core Concepts
 
 ### QueryModel
 
-Keep the SwiftData model to application data, and put sync behavior in an extension:
+A `QueryModel` syncs a whole collection. Keep the SwiftData model to application data, and put sync behavior in an extension:
 
 ```swift
 import SwiftData
@@ -79,6 +79,7 @@ import SwiftQuery
 final class User {
     @Attribute(.unique) var id: String
     var name: String
+    @Relationship(deleteRule: .cascade, inverse: \UserProfile.user) var profile: UserProfile?
 
     init(id: String, name: String) {
         self.id = id
@@ -87,37 +88,84 @@ final class User {
 }
 
 extension User: QueryModel {
-    struct SyncContext: Sendable {
-        let session: URLSession
-    }
-
-    struct SyncState: Codable {
+    struct State: Codable {
         var etag: String?
     }
 
-    static var defaultState: SyncState { .init(etag: nil) }
     static var cache: QueryCache { .forever(refreshAfter: .seconds(5 * 60)) }
+    static var tags: Set<String> { ["users"] }
 
-    static func fetch(
-        context: ModelContext,
-        syncContext: SyncContext,
-        syncState: inout SyncState
-    ) async throws -> Task<Void, Never>? {
-        let response = try await API.users.list(session: syncContext.session, etag: syncState.etag)
-        guard !response.notModified else { return nil } // keep records on 304
-        try context.replaceAll(User.self, with: response.users) { User(id: $0.id, name: $0.name) }
-        syncState.etag = response.etag
-        try context.save()
-        return nil
+    static func fetch(context: ModelContext, fetchContext: APIClient, state: State?) async throws -> State {
+        let response = try await fetchContext.users(etag: state?.etag)
+        guard !response.notModified, let users = response.users else {
+            return state ?? State() // 304: keep records and the ETag
+        }
+        try context.replaceAll(User.self, with: users) { User(id: $0.id, name: $0.name) }
+        return State(etag: response.etag)
     }
 }
 ```
 
-- `SyncContext` holds runtime dependencies. It must be `Sendable` and is never persisted.
-- `SyncState` holds sync metadata. It must be `Codable`. It is loaded before each fetch and persisted only when the fetch succeeds.
+- `Context` holds runtime dependencies. It's inferred from `fetch`, must be `Sendable`, and is never persisted.
+- `State` holds sync metadata, such as an ETag, or for a fetcher the data itself. It's inferred from `fetch`'s return type and must be `Codable`. `fetch` receives the stored state, or `nil` before the first successful fetch, and returns the new state, which is persisted only when the fetch succeeds. It never needs to be optional: "nothing fetched yet" is `.pending`.
 - `fetch` gets a **fresh `ModelContext` for each fetch**. Changes still pending when it returns are saved for you. If it throws, they are discarded. How updates are applied (replace, upsert, event log) is up to you.
-- The initial load is complete when `fetch` returns. `SyncState` is saved once, right after that, and only if the fetch succeeded.
-- `fetch` is cancelled if its model is unregistered, so check for cancellation in long work.
+- The initial load is complete when `fetch` returns. `State` is saved once, right after that.
+- `cache`, `tags`, `subscribe` and `evict` are described below. Only `fetch` and `cache` are required.
+
+### QueryFetcher
+
+A `QueryFetcher` syncs anything that isn't a whole collection. The fetcher value is the key: each distinct value has its own client, state and cache entry.
+
+Data that never touches SwiftData lives in the sync state itself:
+
+```swift
+struct ExchangeRate: QueryFetcher {
+    let from: String, to: String
+    var cache: QueryCache? { .swr(staleTime: .seconds(60)) }
+
+    func fetch(context: ModelContext, fetchContext: APIClient, state: Double?) async throws -> Double {
+        try await fetchContext.rate(from, to)
+    }
+}
+```
+
+A fetcher can also write rows, such as one user's profile:
+
+```swift
+struct UserDetail: QueryFetcher {
+    let id: String
+    var cache: QueryCache? { .swr(staleTime: .seconds(30)) }
+    var tags: Set<String> { ["users", "user-\(id)"] }
+
+    func fetch(context: ModelContext, fetchContext: APIClient, state: Date?) async throws -> Date {
+        let dto = try await fetchContext.profile(userID: id)
+        // find the User row and create or update user.profile...
+        return .now
+    }
+}
+```
+
+- Members are instance members, so `cache` and `tags` can depend on the key.
+- `cache` is required. Return `nil` to keep the state in memory only: it's never persisted, is fetched on the first sync after launch, stays fresh for the session until invalidated, and is dropped with its client.
+- Keep the synthesized `Hashable` and `Codable` conformances. Equality picks the client and the JSON encoding names the stored record, so the two must agree. Changing a fetcher's stored properties changes its keys; records stored under the old keys are deleted without `evict`.
+
+Detail queries come in five kinds, all fetchers keyed by the row's id:
+
+| Kind | Writes | `evict` |
+|---|---|---|
+| A single collection row | Creates, updates or deletes that row | Nothing; the collection owns the row |
+| Extra fields on a row | Columns the list endpoint doesn't return | Clears only those fields |
+| A related model | A model hanging off the row through `.cascade` | Nothing; it's deleted with the row |
+| Rows the fetcher owns | Top-level rows no model owns, such as a user's activity items | Deletes exactly its own rows; the type must be listed in `fetchers:` |
+| Metadata that isn't stored | Only the sync state, often with `cache: nil`, read from `status.value` | Nothing |
+
+Have each stored kind create or update the row from the fields its response includes, so it never depends on the collection having loaded first, as with a deep link to one row.
+
+Where a fetcher's rows live matters for cleanup:
+- Rows a fetcher writes should hang off a model through a `.cascade` relationship, like `User.profile`. The collection then owns their lifecycle, and evicting it removes them.
+- Display-only data belongs in the fetcher's sync state, not in rows.
+- A fetcher that inserts top-level rows owns them: it must delete them in `evict`, scoped to its own key (for example by a `userID` column), and be listed in `fetchers:` so expired keys are evicted even without a client. Don't delete rows another key may show.
+- A fetcher whose `cache` is `nil` shouldn't write rows unless they hang off a model, since nothing evicts them.
 
 #### Isolation
 
@@ -130,53 +178,49 @@ nonisolated extension User: QueryModel { ... }
 Without it, the compiler reports an error like this one:
 
 ```
-main actor-isolated conformance of 'User.SyncState' to 'Decodable' cannot satisfy
-conformance requirement for a 'SendableMetatype' type parameter 'Self.SyncState'
+main actor-isolated conformance of 'User.State' to 'Decodable' cannot satisfy
+conformance requirement for a 'SendableMetatype' type parameter 'Self.State'
 ```
 
 The context passed to `fetch` belongs to that one call. Don't store it or use it from another task.
 
 #### Streams
 
-`fetch` can return a long-lived task, such as a socket subscription. The task is not awaited. Returning `nil` keeps the current task running. Returning a different task cancels the old one and replaces it. The task must not capture `context`. Create its own context from `context.container` instead. Your `SyncContext` should prevent duplicate connections.
-
-By default a stream task can't update `SyncState`. Cursors and ETags only move on the next `fetch`, so the stream's writes should be safe to receive again (for example, upserts by id).
-
-#### SyncedModel: stream sync state
-
-`QueryModel` refines `SyncedModel`, the base protocol the query layer works with. `SyncedModel` declares the same requirements, except its `fetch` also takes a `writer: SyncStateWriter<Self>`. `QueryModel` adds the writer-less `fetch` and implements the writer-taking one for you by ignoring the writer.
-
-Conform to `SyncedModel` directly when re-downloading streamed data is wasteful, or a reconnecting stream needs to resume where it stopped. Implement the `fetch` that takes a `writer`, and pass the writer to your stream:
+Implement `subscribe` to keep a long-lived stream, such as a socket, open while a view shows the key:
 
 ```swift
-extension Message: SyncedModel {
-    static func fetch(
-        context: ModelContext,
-        syncContext: SyncContext,
-        syncState: inout SyncState,
-        writer: SyncStateWriter<Message>
-    ) async throws -> Task<Void, Never>? {
-        let page = try await syncContext.api.messages(after: syncState.seq)
-        // write page.messages into context...
-        syncState.seq = page.lastSeq
-        return await syncContext.socket.connect(container: context.container) { event in
-            await writer.update { state in
-                state.seq = max(state.seq, event.seq)
+extension Message: QueryModel {
+    static func subscribe(
+        container: ModelContainer,
+        fetchContext: Context,
+        state: State?,
+        writer: StateWriter<State>
+    ) -> Task<Void, Never>? {
+        Task {
+            for await event in await fetchContext.socket.events(after: state?.seq ?? 0) {
+                let context = ModelContext(container)
+                context.insert(Message(event))
+                try? context.save()
+                await writer.update { $0.seq = max($0.seq, event.seq) }
             }
         }
     }
 }
 ```
 
-- Updates run in order on the model's sync actor and are saved immediately.
-- While a fetch is in progress, updates are queued and applied on top of that fetch's state when it finishes. Events received during a fetch may also be in its response, so keep updates monotonic, as with `max` above.
-- Updates are dropped when nothing has synced successfully yet, and after the model is unregistered.
-- Updates don't change `lastSyncedAt`, so they don't affect freshness.
-- If 1,000 updates queue up behind one fetch, they're saved right away instead. That fetch's result then replaces them, so those events may be pulled again.
+- The client calls `subscribe` when it gains a view and no stream is running. A stream that ends on its own isn't restarted right away: the next sync from a view, when one appears or its scene becomes active, starts a new one. Fetches alone never start a stream, and a client runs at most one at a time. Retry and backoff for a dropped connection belong inside the task.
+- `subscribe` must not block: do any awaiting inside the returned task. It gets the stored sync state to resume from, and writes rows through its own context from `container`.
+- The stream is cancelled when its client is dropped, its cache is removed, or `cancelStream()` is called.
+- `writer.update` advances the sync state, so the next fetch doesn't pull streamed data again:
+  - Updates run in order on the key's query actor and are saved immediately.
+  - While a fetch is in progress, updates are queued and applied on top of that fetch's state when it finishes. Events received during a fetch may also be in its response, so keep updates monotonic, as with `max` above.
+  - Updates are dropped when nothing has synced successfully yet, and once the client is gone.
+  - Updates don't change `lastSyncedAt`, so they don't affect freshness.
+  - If 1,000 updates queue up behind one fetch, they're saved right away instead. That fetch's result then replaces them, so those events may be pulled again.
 
 #### Eviction
 
-`static func evict(context:)` runs when an SWR cache expires. The default implementation deletes nothing, so locally owned data is never removed implicitly. Implement it to delete only records that came from the server.
+`evict(context:)` runs when a key's SWR cache expires or is removed. The default implementation deletes nothing, so locally owned data is never removed implicitly. Implement it to delete only records that came from the server.
 
 ### QueryCache
 
@@ -187,27 +231,29 @@ extension Message: SyncedModel {
 .swr(staleTime: .seconds(30), cacheTime: .seconds(2 * 60 * 60))
 ```
 
-`cacheTime` counts from the last *use*, not the last fetch. A cache is in use while any `@QueryClient` view is alive. It is also touched by every `sync()` and successful fetch. An expired cache is evicted on the next unobserved `sync`, or when you call `queryProvider.collectGarbage()`, for example when the app moves to the background.
+`cacheTime` counts from the last *use*, not the last fetch. A cache is in use while any `@QueryClient` view is alive. It's also touched by syncs and successful fetches, at most once a minute. An expired cache is evicted on the next unobserved `sync`, or when you call `queryProvider.collectGarbage()`, for example when the app moves to the background.
 
-### State
+`collectGarbage()` also sweeps stored keys that have no client, using each record's stored cache time. Records of types no longer listed in `fetchers:` are deleted without `evict`; `.forever` records are kept. Evicting a key invalidates every other key that shares one of its tags, so a profile loaded by `UserDetail` refetches after the `User` collection it hangs off is evicted.
+
+### Status
 
 ```swift
-enum QueryState<Value> {
+enum QueryStatus<Value> {
     case pending                          // no successful sync yet
     case success(value: Value, stale: Bool)
     case error(any Error)                 // failed with no previous success
 }
 
-enum QueryFetchState { case idle, loading, fetching }
+enum QueryFetchStatus { case idle, loading, fetching }
 ```
 
-`state` carries the model's `SyncState`, not the SwiftData records. `fetchState` tracks fetch activity separately, so data can be stale and fetching at the same time.
+`status` carries the key's `State`, not the SwiftData records. `fetchStatus` tracks fetch activity separately, so data can be stale and fetching at the same time.
 
-When a refresh fails after an earlier success, `state` becomes `.success(value, stale: true)` and the error goes to `client.error`. Cached SwiftData records are never touched by a failed fetch. `client.error` is cleared by the next successful fetch.
+When a refresh fails after an earlier success, `status` becomes `.success(value, stale: true)` and the error goes to `client.error`. Cached SwiftData records are never touched by a failed fetch. `client.error` is cleared by the next successful fetch.
 
 ### QueryProvider
 
-Register every synchronized model once, and include `QueryRecord.self` in the container. The provider creates exactly one client per model:
+Create one provider for the app, and include `QueryRecord.self` in the container:
 
 ```swift
 @main
@@ -216,12 +262,12 @@ struct MyApp: App {
     let queryProvider: QueryProvider
 
     init() {
-        container = try! ModelContainer(for: User.self, Post.self, QueryRecord.self)
+        container = try! ModelContainer(for: User.self, UserProfile.self, Message.self, QueryRecord.self)
+        let api = APIClient()
         queryProvider = QueryProvider(
             modelContainer: container,
-            for:
-                .model(User.self, .init(session: .shared)),
-                .model(Post.self, .init(session: .shared))
+            contexts: api, Message.Context(api: api, socket: Socket()),
+            fetchers: User.self, Message.self, UserDetail.self
         )
     }
 
@@ -235,18 +281,52 @@ struct MyApp: App {
 }
 ```
 
-`register(_:context:)` and `unregister(_:)` are also available. `unregister` cancels the model's stream task and any fetch in progress, and the removed client ignores later calls. Only unregister models that no visible view uses. A view's `@QueryClient` stops syncing, but reading its client afterwards crashes with a missing-registration error.
+- **`contexts:`** registers each value under its static type. A key's `Context` is looked up by type, so models and fetchers that share a context type share its value. To satisfy a protocol-typed context, cast the value: `client as any HTTPClient`. A context type conforming to `DefaultFetchContext` (an `init()`), and `Void`, need no registration. Every listed type's context is checked at launch. An unlisted fetcher with a missing context fails on first use with a message naming the type.
+- **`fetchers:`** lists every persisted model and fetcher type, so the provider can evict their expired caches even when no client exists. Fetchers whose `cache` is `nil` need not be listed. The list doesn't restrict which keys can be used; a debug build asserts when a persisted type is missing from it.
+- **Clients** are created on first use, one per key. A fetcher client nobody uses is kept for `gracePeriod` (5 minutes by default), then dropped, cancelling its stream. A client something still holds is always reused. Model clients live for the whole session.
+
+#### Reading and writing state
+
+```swift
+provider.status(for: UserDetail(id: "42"))                        // no fetch, no client
+try await provider.query(ExchangeRate(from: "USD", to: "EUR"))    // cached if fresh, else fetch
+try await provider.query(UserDetail(id: "42"), staleTime: .infinite)
+provider.prefetch(UserDetail(id: "42"))                           // query without waiting
+try await provider.setState(for: ExchangeRate(from: "USD", to: "EUR"), 0.92)
+```
+
+- `status(for:)` uses the live client if there is one, which views observe. Otherwise it decodes the stored state as a snapshot.
+- `query(_:staleTime:)` returns the state if it's fresh, otherwise fetches and returns the result, throwing if that fetch fails or is cancelled. `staleTime` overrides how old the state may be: `nil` uses the key's own cache policy, `.after(duration)` sets a maximum age (`.after(.zero)` always fetches), and `.infinite` accepts any cached state that wasn't invalidated.
+- `setState(for:_:)` stores state as if a fetch had just returned it, for example a mutation's response.
+- Each method also takes a model type, such as `provider.status(for: User.self)`.
+
+#### Bulk operations
+
+Each takes a fetcher value (one key), a model or fetcher type (every key of it), or `tag:`:
+
+```swift
+provider.invalidate(tag: "users")      // mark stale; observed keys re-sync now
+await provider.refetch(UserDetail.self) // fetch live keys (includeStored: also stored ones)
+provider.cancel(UserDetail(id: "42"))  // stop in-flight fetches
+await provider.remove(tag: "user-42")  // evict rows and state
+await provider.reset(User.self)        // remove, then re-sync observed keys
+```
+
+- Keys without a live client are covered through their stored records.
+- `refetch` only refetches keys that already exist: a live client, or with `includeStored: true`, a stored record of a listed type. A key that was never fetched, or an in-memory key whose client was dropped, is skipped. To fetch any key unconditionally, use `query(key, staleTime: .after(.zero))`.
+- `remove` and `reset` invalidate other keys that share a tag with a removed key.
+- `cancel` is cooperative: a fetch that already saved rows has written them, but its sync state isn't saved and the previous state stays. Call it before an optimistic update so a slow fetch sent earlier can't overwrite the edit.
 
 #### CloudKit
 
-`QueryRecord` works in a CloudKit container (it has no unique constraints, and every property has a default value). Its contents describe one device's local data, though, so keep it out of CloudKit with a local-only configuration:
+`QueryRecord` works in a CloudKit container (it has no unique constraints, and every property has a default value). Its contents describe one device's local data, though, so keep it out of CloudKit with `.queryRecords`, a local-only configuration in its own store:
 
 ```swift
 let container = try ModelContainer(
     for: Schema([User.self, Post.self, QueryRecord.self]),
     configurations:
         ModelConfiguration(schema: Schema([User.self, Post.self]), cloudKitDatabase: .automatic),
-        ModelConfiguration("SwiftQuery", schema: Schema([QueryRecord.self]), cloudKitDatabase: .none)
+        .queryRecords
 )
 ```
 
@@ -265,7 +345,7 @@ struct UsersView: View {
             Text(user.name)
         }
         .overlay {
-            if usersClient.fetchState == .loading {
+            if usersClient.fetchStatus == .loading {
                 ProgressView()
             }
         }
@@ -274,9 +354,25 @@ struct UsersView: View {
         }
     }
 }
+
+struct ProfileView: View {
+    @QueryClient<UserDetail> private var detail: ModelQueryClient<UserDetail>
+    @Query private var users: [User]
+
+    init(id: String) {
+        _detail = QueryClient(UserDetail(id: id))
+        _users = Query(filter: #Predicate { $0.id == id })
+    }
+    // users.first?.profile
+}
+
+struct RateView: View {
+    @QueryClient(ExchangeRate(from: "USD", to: "EUR")) private var rate
+    // rate.status.value
+}
 ```
 
-The wrapper returns the provider's shared `ModelQueryClient<User>`. It requests a sync when the view appears and again whenever its scene becomes active, never on a plain `body` evaluation. A cache override applies only to that view's sync requests. Every view shares the same state, metadata, and in-flight fetches.
+The wrapper returns the provider's shared client for its key. It requests a sync when the view appears and again whenever its scene becomes active, never on a plain `body` evaluation, and starts the key's stream if it has one. A cache override applies only to that view's sync requests. Every view of a key shares the same state, metadata, and in-flight fetches.
 
 ### Client operations
 
@@ -285,10 +381,11 @@ usersClient.sync()                               // default cache policy
 usersClient.sync(.swr(staleTime: .seconds(30)))  // per-request policy
 await usersClient.refresh()                      // always fetch, deduplicated
 usersClient.invalidate()                         // next sync fetches; no network now
+usersClient.cancel()                             // stop the in-flight fetch
 usersClient.cancelStream()
 ```
 
-Concurrent `sync()` and `refresh()` calls share a single `fetch`. `sync()` and `invalidate()` run in the order they are called. A stored `SyncState` that no longer decodes (for example after you change its type) counts as missing, so the next sync fetches from `defaultState`.
+Concurrent `sync()` and `refresh()` calls share a single `fetch`. `sync()` and `invalidate()` run in the order they are called. A stored `State` that no longer decodes (for example after you change its type) counts as missing, so the next sync fetches as if nothing were stored, passing `nil`.
 
 ### Mutations
 
@@ -316,14 +413,15 @@ try await usersClient.mutate {
 - The optimistic closure runs on the main context, so `@Query` updates right away. The context is saved afterwards, and again after a rollback, so an unsaved edit can't later overwrite what a refetch brought in. If that save fails, the rollback runs and the error is thrown before anything is sent.
 - The save commits every pending change in the shared main context. If your app turns `autosaveEnabled` off on the main context (to hold drafts, for example), nothing is saved for you, and your optimistic and rollback closures must save themselves.
 - **Cancellation:** the remote call runs in its own task. Cancelling the caller, for example when a `.task` view goes away, doesn't cancel a call that was already sent, and the caller still gets its result. A caller cancelled before its call is sent rolls back and throws `CancellationError`.
-- **Success:** optimistic changes are kept, then the client awaits a fetch that starts after the mutation. A fetch already in progress may have been sent before the server applied the mutation, so it isn't trusted. If that fetch fails, the mutation is still treated as committed. Nothing rolls back or throws, and the failure shows up in `state` and `error`.
-- **Failure:** the rollback runs and the mutation error is rethrown. Mutation errors never set `state` to `.error`.
+- **Success:** optimistic changes are kept, then the client awaits a fetch that starts after the mutation. A fetch already in progress may have been sent before the server applied the mutation, so it isn't trusted. If that fetch fails, the mutation is still treated as committed. Nothing rolls back or throws, and the failure shows up in `status` and `error`.
+- **Failure:** the rollback runs and the mutation error is rethrown. Mutation errors never set `status` to `.error`.
+- **Related keys:** a mutation refetches only its own client's key. To update a list after editing a detail, or the reverse, invalidate by type or tag afterwards, for example `provider.invalidate(tag: "users")`.
 - **Concurrent mutations:** if a newer optimistic mutation started after the one that failed, the older rollback is skipped so it can't overwrite the newer change. The client then refreshes once no mutations are pending.
 - **Refetch overlap:** a refetch writes the server's current data straight to SwiftData. If it runs while another mutation's remote call is still in flight, that mutation's optimistic edit can briefly show the older server value until its own refetch. Put related mutations in one scope to avoid this.
 
 #### Scopes
 
-Mutations with the same `scope` send their remote calls one at a time, in the order `mutate` was called. Mutations without a scope run in parallel. Scopes are shared by every model registered with the provider, so one scope can order mutations across models. A per-record scope is typical:
+Mutations with the same `scope` send their remote calls one at a time, in the order `mutate` was called. Mutations without a scope run in parallel. Scopes are shared by every client of the provider, so one scope can order mutations across models and fetchers. A per-record scope is typical:
 
 ```swift
 try await usersClient.mutate(scope: "user-\(id)") {
@@ -336,5 +434,5 @@ try await usersClient.mutate(scope: "user-\(id)") {
 - Optimistic updates still apply as soon as `mutate` is called. Only the remote call waits.
 - A failure doesn't cancel later mutations in the scope. Each error goes only to its own caller.
 - A failed mutation rolls back unless a newer optimistic mutation started in the same scope. Always use the same scope, or always none, for a given record. Otherwise a failed mutation can roll back a newer edit made under a different scope.
-- The refetch runs once the scope has nothing left queued, for every model a mutation in it touched, so the server state doesn't flicker between queued mutations. Only the caller of the last mutation awaits it.
+- The refetch runs once the scope has nothing left queued, for every key a mutation in it touched, so the server state doesn't flicker between queued mutations. Only the caller of the last mutation awaits it.
 - A caller cancelled while queued stops waiting right away, rolls back, and throws `CancellationError` without sending its remote call. Later mutations in the scope keep their order.

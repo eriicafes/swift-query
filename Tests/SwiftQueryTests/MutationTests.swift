@@ -6,7 +6,7 @@ import Testing
 @MainActor
 @Suite("Mutations")
 struct MutationTests {
-    func rename(_ client: ModelQueryClient<TestUser>, id: String, to name: String) -> @MainActor (ModelContext) throws -> Rollback? {
+    func rename(_ client: UsersClient, id: String, to name: String) -> @MainActor (ModelContext) throws -> MutationRollback? {
         { context in
             let descriptor = FetchDescriptor<TestUser>(predicate: #Predicate { $0.id == id })
             guard let user = try context.fetch(descriptor).first else { return nil }
@@ -21,7 +21,7 @@ struct MutationTests {
         }
     }
 
-    func syncedClient() async throws -> (ModelQueryClient<TestUser>, FakeServer, QueryProvider) {
+    func syncedClient() async throws -> (UsersClient, FakeServer, QueryProvider) {
         let (provider, client, server) = try makeProvider()
         client.sync()
         await client.settle()
@@ -57,7 +57,7 @@ struct MutationTests {
 
         await #expect(throws: ServerError.self) { try await mutation.value }
         #expect(try localUsers(client)["1"] == "Ada")
-        #expect(client.state.isError == false)
+        #expect(client.status.isError == false)
         #expect(client.error == nil)
         #expect(await server.fetchCount == 1)
     }
@@ -74,7 +74,7 @@ struct MutationTests {
         #expect(result == "Ada L.")
         #expect(try localUsers(client)["1"] == "Ada L.")
         #expect(client.error is ServerError)
-        #expect(client.state.isStale)
+        #expect(client.status.isStale)
     }
 
     @Test("An older failed mutation does not roll back a newer change")
@@ -133,7 +133,7 @@ struct MutationTests {
             try ModelContext(client.modelContainer)
                 .fetch(FetchDescriptor<TestUser>(predicate: #Predicate { $0.id == "1" })).first?.name
         }
-        let unsavedRename: @MainActor (ModelContext) throws -> Rollback? = { context in
+        let unsavedRename: @MainActor (ModelContext) throws -> MutationRollback? = { context in
             let user = try #require(try context.fetch(FetchDescriptor<TestUser>(predicate: #Predicate { $0.id == "1" })).first)
             user.name = "Unsaved"
             return { context in
@@ -199,7 +199,7 @@ struct MutationTests {
         var saves = 0
 
         #expect(throws: SaveFailure.self) {
-            try ModelQueryClient<TestUser>.applyOptimistic(
+            try UsersClient.applyOptimistic(
                 rename(client, id: "1", to: "Broken"),
                 in: context,
                 save: { _ in

@@ -1,59 +1,65 @@
 import SwiftUI
 
-/// Connects a view to the shared ``ModelQueryClient`` for a model and syncs it
-/// when the view appears.
+/// Connects a view to the shared ``ModelQueryClient`` for a key and syncs it while the view is
+/// alive.
 ///
 /// ```swift
-/// @QueryClient(User.self, .swr(staleTime: .seconds(30)))
-/// private var usersClient
-///
-/// @Query(sort: \User.name)
-/// private var users: [User]
+/// @QueryClient(User.self) private var usersClient
+/// @QueryClient(UserDetail(id: id)) private var detail
+/// @QueryClient(ExchangeRate(from: "USD", to: "EUR"), .swr(staleTime: .seconds(10))) private var rate
 /// ```
 ///
-/// The client is shared through the environment's ``QueryProvider``; the wrapper never creates
-/// its own. A sync is requested when the view appears and again whenever its scene becomes
-/// active, not on every body evaluation. The cache override applies only to those requests.
-/// While the view is alive the model's cache counts as in use and is not garbage collected.
+/// The client comes from the environment's ``QueryProvider``, which creates it on first use.
+/// A sync is requested when the view appears and again whenever its scene becomes active, not on
+/// every body evaluation; the key's stream starts if it has one. The cache override applies
+/// only to this view's requests. While the view is alive the key counts as in use: its client is
+/// kept and its cache isn't garbage collected.
 @propertyWrapper
-public struct QueryClient<Model: SyncedModel>: DynamicProperty {
+public struct QueryClient<Fetcher: QueryFetcher>: DynamicProperty {
     @Environment(QueryProvider.self) private var provider
     @Environment(\.scenePhase) private var scenePhase
-    @State private var subscription = Subscription<Model>()
+    @State private var subscription = Subscription<Fetcher>()
+    private let fetcher: Fetcher
     private let cache: QueryCache?
 
-    public init(_ model: Model.Type, _ cache: QueryCache? = nil) {
+    /// Syncs a fetcher key.
+    public init(_ fetcher: Fetcher, _ cache: QueryCache? = nil) {
+        self.fetcher = fetcher
         self.cache = cache
     }
 
+    /// Syncs a model collection.
+    public init<M: QueryModel>(_ model: M.Type, _ cache: QueryCache? = nil) where Fetcher == ModelFetcher<M> {
+        self.init(ModelFetcher<M>(), cache)
+    }
+
     @MainActor
-    public var wrappedValue: ModelQueryClient<Model> {
-        provider.client(for: Model.self)
+    public var wrappedValue: ModelQueryClient<Fetcher> {
+        provider.client(for: fetcher)
     }
 
     public nonisolated func update() {
         let subscription = subscription
         let provider = provider
+        let fetcher = fetcher
         let cache = cache
         let scenePhase = scenePhase
         MainActor.assumeIsolated {
-            // An unregistered model only fails when the view actually reads the client.
-            guard let client = provider.registeredClient(for: Model.self) else { return }
-            subscription.activate(client, cache: cache, phase: scenePhase)
+            subscription.activate(provider.client(for: fetcher), cache: cache, phase: scenePhase)
         }
     }
 }
 
-/// Tracks one view's subscription: syncs when it first activates and when its scene
-/// becomes active again, never on plain body re-evaluations.
+/// Tracks one view's subscription: syncs when it first activates or its key changes, and when
+/// its scene becomes active again, never on plain body re-evaluations.
 @MainActor
-final class Subscription<Model: SyncedModel> {
-    private var client: ModelQueryClient<Model>?
+final class Subscription<Fetcher: QueryFetcher> {
+    private var client: ModelQueryClient<Fetcher>?
     private var phase: ScenePhase?
 
     nonisolated init() {}
 
-    func activate(_ client: ModelQueryClient<Model>, cache: QueryCache?, phase: ScenePhase = .active) {
+    func activate(_ client: ModelQueryClient<Fetcher>, cache: QueryCache?, phase: ScenePhase = .active) {
         defer { self.phase = phase }
         guard self.client === client else {
             self.client?.detach()
@@ -62,7 +68,7 @@ final class Subscription<Model: SyncedModel> {
             return
         }
         if phase == .active, let previous = self.phase, previous != .active {
-            client.sync(cache ?? Model.cache)
+            client.sync(cache ?? client.fetcher.cache ?? .forever())
         }
     }
 

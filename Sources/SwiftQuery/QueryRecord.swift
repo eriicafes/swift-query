@@ -1,26 +1,26 @@
 import Foundation
 import SwiftData
 
-/// Persisted synchronization metadata for one ``SyncedModel`` type.
+/// Persisted synchronization metadata for one model or fetcher key.
 ///
 /// Include `QueryRecord.self` in your `ModelContainer` schema. The model is CloudKit-compatible
 /// (no unique constraints, every property has a default), but sync metadata describes one
-/// device's local data, so keep it in a local-only configuration when the app uses CloudKit:
+/// device's local data, so keep it in its own local-only store when the app uses CloudKit, with
+/// ``SwiftData/ModelConfiguration/queryRecords``:
 ///
 /// ```swift
-/// let schema = Schema([User.self, QueryRecord.self])
 /// let container = try ModelContainer(
-///     for: schema,
+///     for: Schema([User.self, QueryRecord.self]),
 ///     configurations:
 ///         ModelConfiguration(schema: Schema([User.self]), cloudKitDatabase: .automatic),
-///         ModelConfiguration("SwiftQuery", schema: Schema([QueryRecord.self]), cloudKitDatabase: .none)
+///         .queryRecords
 /// )
 /// ```
 @Model
 public final class QueryRecord {
     /// The model type's identity.
     public var key: String = ""
-    /// The encoded ``SyncedModel/SyncState`` from the last successful fetch.
+    /// The encoded ``QueryFetcher/State`` from the last successful fetch.
     public var stateData: Data?
     /// When the last successful fetch finished.
     public var lastSyncedAt: Date?
@@ -28,19 +28,27 @@ public final class QueryRecord {
     public var lastAccessedAt: Date?
     /// Whether the next sync must fetch again.
     public var invalidated: Bool = false
+    /// The key's tags, encoded for exact `contains` matching. See ``QueryFetcher/tags``.
+    public var tags: String = ""
+    /// The SWR cache time in seconds, or `nil` when the cache never expires.
+    public var cacheTime: Double?
 
     public init(
         key: String,
         stateData: Data? = nil,
         lastSyncedAt: Date? = nil,
         lastAccessedAt: Date? = nil,
-        invalidated: Bool = false
+        invalidated: Bool = false,
+        tags: String = "",
+        cacheTime: Double? = nil
     ) {
         self.key = key
         self.stateData = stateData
         self.lastSyncedAt = lastSyncedAt
         self.lastAccessedAt = lastAccessedAt
         self.invalidated = invalidated
+        self.tags = tags
+        self.cacheTime = cacheTime
     }
 }
 
@@ -53,5 +61,83 @@ extension QueryRecord {
         )
         descriptor.fetchLimit = limit
         return descriptor
+    }
+}
+
+extension QueryRecord {
+    /// Whether the record's cache expired under its stored ``cacheTime``.
+    func isExpired(now: Date) -> Bool {
+        guard let cacheTime, stateData != nil,
+              let lastUse = lastAccessedAt ?? lastSyncedAt
+        else { return false }
+        return now >= lastUse.addingTimeInterval(cacheTime)
+    }
+}
+
+extension QueryRecord {
+    /// Record keys: a model's type name, or a fetcher's type name and its value as sorted JSON.
+    enum Key {
+        static func make<F: QueryFetcher>(_ fetcher: F) -> String {
+            if let model = F.self as? any ModelFetcherKind.Type {
+                return model.modelTypeName
+            }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+            guard let data = try? encoder.encode(fetcher) else {
+                preconditionFailure("Couldn't encode the fetcher \(fetcher) to build its record key")
+            }
+            return "\(String(reflecting: F.self)):\(String(decoding: data, as: UTF8.self))"
+        }
+
+        static func typeName(of key: String) -> String {
+            key.firstIndex(of: ":").map { String(key[..<$0]) } ?? key
+        }
+
+        static func isModel(_ key: String) -> Bool {
+            !key.contains(":")
+        }
+
+        static func decode<F: QueryFetcher>(_: F.Type, from key: String) -> F? {
+            if F.self is any ModelFetcherKind.Type {
+                return try? JSONDecoder().decode(F.self, from: Data("{}".utf8))
+            }
+            guard let colon = key.firstIndex(of: ":") else { return nil }
+            return try? JSONDecoder().decode(F.self, from: Data(key[key.index(after: colon)...].utf8))
+        }
+    }
+
+    /// Tags stored in one string as `,tag1,tag2,`, with `%` and `,` percent-encoded so a comma is
+    /// always a delimiter and a `contains` check for `,tag,` matches exactly.
+    enum Tags {
+        static func encode(_ tags: Set<String>) -> String {
+            tags.isEmpty ? "" : "," + tags.sorted().map(escape).joined(separator: ",") + ","
+        }
+
+        static func decode(_ string: String) -> Set<String> {
+            Set(string.split(separator: ",").map { unescape(String($0)) })
+        }
+
+        static func needle(_ tag: String) -> String {
+            "," + escape(tag) + ","
+        }
+
+        static func escape(_ tag: String) -> String {
+            tag.replacingOccurrences(of: "%", with: "%25").replacingOccurrences(of: ",", with: "%2C")
+        }
+
+        static func unescape(_ tag: String) -> String {
+            tag.replacingOccurrences(of: "%2C", with: ",").replacingOccurrences(of: "%25", with: "%")
+        }
+    }
+}
+
+extension ModelConfiguration {
+    /// A local-only configuration holding just ``QueryRecord``, for apps whose other models sync
+    /// with CloudKit.
+    ///
+    /// Its store is named "SwiftQuery" so it never shares a file with the app's own
+    /// configurations, and it never syncs: sync metadata describes one device's local data.
+    public static var queryRecords: ModelConfiguration {
+        ModelConfiguration("SwiftQuery", schema: Schema([QueryRecord.self]), cloudKitDatabase: .none)
     }
 }

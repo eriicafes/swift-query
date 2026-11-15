@@ -35,9 +35,10 @@ final class MutationScheduler {
     }
 }
 
-/// A one-shot signal: waiters resume when it opens.
+/// A one-shot signal for scoped mutations: a queued mutation waits on the previous one's gate,
+/// which opens when that mutation's remote call finishes.
 @MainActor
-final class Gate {
+final class MutationGate {
     private var isOpen = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 

@@ -3,52 +3,88 @@ import Observation
 import SwiftData
 
 /// Reverts an optimistic update. Captures whatever previous values it needs.
-public typealias Rollback = @MainActor (ModelContext) throws -> Void
+public typealias MutationRollback = @MainActor (ModelContext) throws -> Void
 
-/// The observable, main-actor interface to one model's synchronization.
+/// The observable, main-actor interface to one key's synchronization: a model collection or a
+/// ``QueryFetcher`` value.
 ///
-/// A ``QueryProvider`` owns one shared client per registered model type. Views obtain it
-/// with ``QueryClient`` and read application data with SwiftData's `@Query`.
+/// A ``QueryProvider`` creates one shared client per key, lazily. Views obtain it with
+/// ``QueryClient`` and read application data with SwiftData's `@Query`; data that lives only in
+/// the sync state is read from ``status``.
 @Observable
 @MainActor
-public final class ModelQueryClient<Model: SyncedModel> {
-    /// The synchronization state, carrying the persisted ``SyncedModel/SyncState``.
-    public private(set) var state: QueryState<Model.SyncState> = .pending
+public final class ModelQueryClient<Fetcher: QueryFetcher> {
+    /// The synchronization state, carrying the persisted ``QueryFetcher/State``.
+    public private(set) var status: QueryStatus<Fetcher.State> = .pending
     /// The current fetch activity.
-    public private(set) var fetchState: QueryFetchState = .idle
+    public private(set) var fetchStatus: QueryFetchStatus = .idle
     /// The error of the last failed fetch, cleared by the next successful fetch.
     ///
-    /// When a refresh fails after a previous success, ``state`` stays a stale
+    /// When a refresh fails after a previous success, ``status`` stays a stale
     /// `success` and the failure is reported here.
     public private(set) var error: (any Error)?
 
+    /// The key this client syncs.
+    public let fetcher: Fetcher
     /// The container whose main context is used for optimistic updates.
     public let modelContainer: ModelContainer
 
-    @ObservationIgnored private let actor: ModelQueryActor<Model>
+    @ObservationIgnored let recordKey: String
+    @ObservationIgnored private let actor: QueryActor<Fetcher>
     @ObservationIgnored private var tail: Task<Void, Never>?
     @ObservationIgnored private var lastSequence: UInt64 = 0
     @ObservationIgnored private var stateData: Data?
     @ObservationIgnored private let scheduler: MutationScheduler
     /// Bookkeeping for this client's unscoped mutations, which run in parallel.
     @ObservationIgnored private let unscoped = MutationGroup()
+    @ObservationIgnored private var observerCount = 0
+    @ObservationIgnored private var mutationCount = 0
+    @ObservationIgnored private var wasActive = false
+    /// Told whenever the client starts or stops being in use, so the provider can keep or drop it.
+    @ObservationIgnored var onActivityChange: (@MainActor () -> Void)?
+    /// Bumped whenever the client becomes idle; a pending release only applies to its own idle spell.
+    @ObservationIgnored var idleGeneration: UInt64 = 0
 
-    /// Created only by ``QueryProvider``, so each model has a single client and actor.
+    /// Created only by ``QueryProvider``, so each key has a single client and actor.
     init(
+        fetcher: Fetcher,
+        recordKey: String,
         modelContainer: ModelContainer,
-        syncContext: Model.SyncContext,
-        scheduler: MutationScheduler = MutationScheduler()
+        fetchContext: Fetcher.Context,
+        scheduler: MutationScheduler = MutationScheduler(),
+        onEvict: @escaping QueryActor<Fetcher>.EvictHandler = { _, _ in }
     ) {
-        let sink = SnapshotSink<Model>()
+        let sink = SnapshotSink<Fetcher>()
+        self.fetcher = fetcher
+        self.recordKey = recordKey
         self.modelContainer = modelContainer
         self.scheduler = scheduler
-        self.actor = ModelQueryActor(
+        self.actor = QueryActor(
+            fetcher: fetcher,
+            key: recordKey,
             modelContainer: modelContainer,
-            syncContext: syncContext,
-            publisher: { snapshot in await sink.receive(snapshot) }
+            fetchContext: fetchContext,
+            publisher: { snapshot in await sink.receive(snapshot) },
+            onEvict: onEvict
         )
         sink.client = self
         loadInitialState()
+    }
+
+    /// Whether a view observes the client, or a fetch or mutation is running.
+    var isActive: Bool {
+        observerCount > 0 || mutationCount > 0 || fetchStatus != .idle
+    }
+
+    var isObserved: Bool { observerCount > 0 }
+
+    private var defaultCache: QueryCache { fetcher.cache ?? .forever() }
+
+    private func activityChanged() {
+        let active = isActive
+        guard active != wasActive else { return }
+        wasActive = active
+        onActivityChange?()
     }
 
     // MARK: Synchronization
@@ -56,7 +92,7 @@ public final class ModelQueryClient<Model: SyncedModel> {
     /// Schedules a freshness check using the model's default cache policy,
     /// fetching if the data is stale, invalidated, or missing.
     public func sync() {
-        sync(Model.cache)
+        sync(defaultCache)
     }
 
     /// Schedules a freshness check using `cache` for this request only.
@@ -76,7 +112,14 @@ public final class ModelQueryClient<Model: SyncedModel> {
         enqueue { await $0.invalidate() }
     }
 
-    /// Cancels the stream task returned by ``SyncedModel/fetch(context:syncContext:syncState:writer:)``, if any.
+    /// Cancels the in-flight fetch, if any. Rows it already saved stay, its sync state is not
+    /// saved, and ``status`` keeps its previous value. Call it before an optimistic update so a
+    /// slow fetch sent earlier can't overwrite the edit.
+    public func cancel() {
+        enqueue { await $0.cancelFetch() }
+    }
+
+    /// Cancels the stream started by `subscribe`, if any. The next sync from a view starts a new one.
     public func cancelStream() {
         enqueue { await $0.cancelStream() }
     }
@@ -95,12 +138,12 @@ public final class ModelQueryClient<Model: SyncedModel> {
     /// - On success, optimistic changes are kept and the client awaits a fetch that starts after
     ///   the mutation, so a fetch already in flight (possibly sent before the mutation reached the
     ///   server) can't leave stale data behind. A failed refresh does not roll back or throw; it is
-    ///   reported through ``state`` and ``error``.
+    ///   reported through ``status`` and ``error``.
     /// - On failure, the returned rollback runs and the mutation error is rethrown. If a newer
     ///   optimistic mutation has started since, the rollback is skipped so it cannot clobber the
     ///   newer change, and the client refetches once no mutations are pending.
     ///
-    /// Mutation failures never change ``state`` to `.error`.
+    /// Mutation failures never change ``status`` to `.error`.
     ///
     /// A refetch writes the server's current data straight to SwiftData. If it runs while another
     /// mutation's remote call is still in flight, that mutation's optimistic edit can briefly show
@@ -125,13 +168,19 @@ public final class ModelQueryClient<Model: SyncedModel> {
     public func mutate<Result>(
         scope: (any Hashable & Sendable)? = nil,
         _ mutation: @escaping @Sendable () async throws -> sending Result,
-        optimistic: (@MainActor (ModelContext) throws -> Rollback?)? = nil
+        optimistic: (@MainActor (ModelContext) throws -> MutationRollback?)? = nil
     ) async throws -> Result {
+        mutationCount += 1
+        activityChanged()
+        defer {
+            mutationCount -= 1
+            activityChanged()
+        }
         let scopeKey = scope.map { AnyHashable($0) }
         let group = scopeKey.map { scheduler.group(for: $0) } ?? unscoped
         let context = modelContainer.mainContext
 
-        var rollback: Rollback?
+        var rollback: MutationRollback?
         var optimisticID: UInt64?
         if let optimistic {
             do {
@@ -147,9 +196,9 @@ public final class ModelQueryClient<Model: SyncedModel> {
 
         // Scoped: wait for the previous mutation's remote call, and let the next one wait for ours.
         var previous: Task<Void, Never>?
-        var gate: Gate?
+        var gate: MutationGate?
         if scopeKey != nil {
-            let ownGate = Gate()
+            let ownGate = MutationGate()
             previous = group.tail
             let waitFor = previous
             group.tail = Task {
@@ -230,7 +279,7 @@ public final class ModelQueryClient<Model: SyncedModel> {
     /// Leaving early never reorders the queue: the next mutation still waits for `previous`.
     private static func waitForTurn(after previous: Task<Void, Never>?) async {
         guard let previous else { return }
-        let turn = Gate()
+        let turn = MutationGate()
         Task {
             await previous.value
             turn.open()
@@ -245,10 +294,10 @@ public final class ModelQueryClient<Model: SyncedModel> {
     /// Applies an optimistic update and saves it. If the save fails, the update's own rollback
     /// runs before the error is rethrown, so a mutation that never ran leaves nothing behind.
     static func applyOptimistic(
-        _ optimistic: @MainActor (ModelContext) throws -> Rollback?,
+        _ optimistic: @MainActor (ModelContext) throws -> MutationRollback?,
         in context: ModelContext,
         save: @MainActor (ModelContext) throws -> Void = saveIfNeeded
-    ) throws -> Rollback? {
+    ) throws -> MutationRollback? {
         let rollback = try optimistic(context)
         do {
             try save(context)
@@ -278,16 +327,51 @@ public final class ModelQueryClient<Model: SyncedModel> {
     // MARK: Internal
 
     func attach(_ cache: QueryCache?) {
-        enqueue { await $0.attach(cache ?? Model.cache) }
+        observerCount += 1
+        activityChanged()
+        let cache = cache ?? defaultCache
+        enqueue { await $0.attach(cache) }
+    }
+
+    /// Syncs again with the key's most recent cache policy.
+    func resync() {
+        enqueue { await $0.resync() }
     }
 
     func detach() {
+        observerCount = max(0, observerCount - 1)
+        activityChanged()
         enqueue { await $0.detach() }
     }
 
-    /// Stops the client after its model is unregistered.
-    func retire() {
-        enqueue { await $0.retire() }
+    func query(staleTime: StaleTime?) async throws -> Fetcher.State {
+        await tail?.value
+        let data = try await actor.query(staleTime: staleTime)
+        return try JSONDecoder().decode(Fetcher.State.self, from: data)
+    }
+
+    func setState(_ value: Fetcher.State) async throws {
+        let data = try JSONEncoder().encode(value)
+        await tail?.value
+        await actor.setState(data)
+    }
+
+    func remove() async {
+        await tail?.value
+        await actor.remove()
+    }
+
+    func reset() async {
+        await tail?.value
+        await actor.reset()
+    }
+
+    func isStreaming() async -> Bool {
+        await actor.isStreaming
+    }
+
+    func subscriptions() async -> Int {
+        await actor.subscriptions
     }
 
     private func refetch() async {
@@ -297,7 +381,7 @@ public final class ModelQueryClient<Model: SyncedModel> {
 
     func collectGarbage() async {
         await tail?.value
-        await actor.collectGarbage(Model.cache)
+        await actor.collectGarbage()
     }
 
     /// Waits for scheduled operations and any in-flight fetch to finish.
@@ -323,24 +407,25 @@ public final class ModelQueryClient<Model: SyncedModel> {
         switch snapshot.status {
         case .pending:
             stateData = nil
-            if !state.isPending {
-                state = .pending
+            if !status.isPending {
+                status = .pending
             }
         case .success(let data, let stale):
-            guard data != stateData || stale != state.isStale || state.value == nil else { break }
-            if let value = try? JSONDecoder().decode(Model.SyncState.self, from: data) {
+            guard data != stateData || stale != status.isStale || status.value == nil else { break }
+            if let value = try? JSONDecoder().decode(Fetcher.State.self, from: data) {
                 stateData = data
-                state = .success(value: value, stale: stale)
+                status = .success(value: value, stale: stale)
             } else {
                 stateData = nil
-                state = .pending
+                status = .pending
             }
         case .error(let error):
             stateData = nil
-            state = .error(error)
+            status = .error(error)
         }
-        if fetchState != snapshot.fetchState {
-            fetchState = snapshot.fetchState
+        if fetchStatus != snapshot.fetchStatus {
+            fetchStatus = snapshot.fetchStatus
+            activityChanged()
         }
         if snapshot.error != nil || error != nil {
             error = snapshot.error
@@ -349,7 +434,7 @@ public final class ModelQueryClient<Model: SyncedModel> {
 
     /// Runs operations in call order. Operations only check state and start fetches,
     /// so they never wait behind a running fetch.
-    private func enqueue(_ operation: @escaping @Sendable (ModelQueryActor<Model>) async -> Void) {
+    private func enqueue(_ operation: @escaping @Sendable (QueryActor<Fetcher>) async -> Void) {
         let previous = tail
         let actor = actor
         tail = Task {
@@ -360,30 +445,58 @@ public final class ModelQueryClient<Model: SyncedModel> {
 
     /// Reads persisted metadata synchronously so views don't flash `.pending` on launch.
     private func loadInitialState() {
-        guard let record = try? modelContainer.mainContext.fetch(QueryRecord.descriptor(key: Model.queryKey, limit: 1)).first,
+        guard fetcher.cache != nil,
+              let (value, data, stale) = Self.storedState(fetcher, key: recordKey, in: modelContainer.mainContext)
+        else { return }
+        stateData = data
+        status = .success(value: value, stale: stale)
+    }
+
+    /// Decodes a key's stored state, if it has usable state.
+    static func storedState(
+        _ fetcher: Fetcher,
+        key: String,
+        in context: ModelContext
+    ) -> (Fetcher.State, Data, stale: Bool)? {
+        guard let record = try? context.fetch(QueryRecord.descriptor(key: key, limit: 1)).first,
               let data = record.stateData,
               let lastSyncedAt = record.lastSyncedAt,
-              let value = try? JSONDecoder().decode(Model.SyncState.self, from: data)
-        else { return }
-        let stale = record.invalidated || Model.cache.isStale(lastSyncedAt: lastSyncedAt, now: .now)
-        stateData = data
-        state = .success(value: value, stale: stale)
+              let value = try? JSONDecoder().decode(Fetcher.State.self, from: data)
+        else { return nil }
+        let stale = record.invalidated
+            || (fetcher.cache ?? .forever()).isStale(lastSyncedAt: lastSyncedAt, now: .now)
+        return (value, data, stale)
     }
 }
 
 /// Delivers snapshots to a client without the actor retaining it.
 @MainActor
-private final class SnapshotSink<Model: SyncedModel> {
-    weak var client: ModelQueryClient<Model>?
+private final class SnapshotSink<Fetcher: QueryFetcher> {
+    weak var client: ModelQueryClient<Fetcher>?
 
     func receive(_ snapshot: QuerySnapshot) {
         client?.receive(snapshot)
     }
 }
 
+@MainActor
 protocol AnyModelQueryClient: AnyObject {
-    @MainActor func collectGarbage() async
-    @MainActor func retire()
+    var recordKey: String { get }
+    var tagSet: Set<String> { get }
+    var isActive: Bool { get }
+    var isObserved: Bool { get }
+    var isModel: Bool { get }
+    var idleGeneration: UInt64 { get set }
+    func collectGarbage() async
+    func invalidate()
+    func resync()
+    func refresh() async
+    func cancel()
+    func remove() async
+    func reset() async
 }
 
-extension ModelQueryClient: AnyModelQueryClient {}
+extension ModelQueryClient: AnyModelQueryClient {
+    var tagSet: Set<String> { fetcher.tags }
+    var isModel: Bool { Fetcher.self is any ModelFetcherKind.Type }
+}

@@ -6,7 +6,7 @@ import Testing
 @MainActor
 @Suite("Scoped mutations")
 struct ScopedMutationTests {
-    func rename(id: String, to name: String) -> @MainActor (ModelContext) throws -> Rollback? {
+    func rename(id: String, to name: String) -> @MainActor (ModelContext) throws -> MutationRollback? {
         { context in
             let descriptor = FetchDescriptor<TestUser>(predicate: #Predicate { $0.id == id })
             guard let user = try context.fetch(descriptor).first else { return nil }
@@ -21,7 +21,7 @@ struct ScopedMutationTests {
         }
     }
 
-    func syncedClient() async throws -> (ModelQueryClient<TestUser>, FakeServer, QueryProvider) {
+    func syncedClient() async throws -> (UsersClient, FakeServer, QueryProvider) {
         let (provider, client, server) = try makeProvider()
         client.sync()
         await client.settle()
@@ -216,9 +216,8 @@ struct ScopedMutationTests {
         let feed = FeedServer()
         let provider = QueryProvider(
             modelContainer: try makeContainer(),
-            for:
-                .model(TestUser.self, .init(server: server)),
-                .model(TestFeed.self, .init(server: feed))
+            contexts: TestUser.Context(server: server), TestFeed.Context(server: feed),
+            fetchers: TestUser.self, TestFeed.self
         )
         let users = provider.client(for: TestUser.self)
         let feeds = provider.client(for: TestFeed.self)

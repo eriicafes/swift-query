@@ -14,19 +14,19 @@ actor FakeServer {
     private(set) var users: [String: String]
     private(set) var fetchCount = 0
     private(set) var requestedEtags: [Int?] = []
-    private(set) var streams: [Task<Void, Never>] = []
+    /// How many streams started and how many ended (by cancellation).
+    private(set) var streamsStarted = 0
+    private(set) var streamsEnded = 0
     /// "start:<name>" and "end:<name>" for each rename, in order.
     private(set) var renameLog: [String] = []
     private var etag = 0
     private var failures: [any Error] = []
-    private var streaming = false
 
     init(users: [String: String] = ["1": "Ada", "2": "Grace"]) {
         self.users = users
     }
 
     func failNextFetch(_ error: any Error = ServerError()) { failures.append(error) }
-    func setStreaming(_ streaming: Bool) { self.streaming = streaming }
 
     func list(etag requested: Int?) async throws -> (users: [String: String], etag: Int) {
         fetchCount += 1
@@ -39,11 +39,19 @@ actor FakeServer {
         return (snapshot, etag)
     }
 
-    func makeStream() -> Task<Void, Never>? {
-        guard streaming else { return nil }
-        let task = Task<Void, Never> { try? await Task.sleep(for: .seconds(3600)) }
-        streams.append(task)
-        return task
+    /// A stream that stays open until its task is cancelled.
+    func stream() async {
+        streamsStarted += 1
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(3600))
+        }
+        streamsEnded += 1
+    }
+
+    /// A stream that ends on its own right away.
+    func shortStream() {
+        streamsStarted += 1
+        streamsEnded += 1
     }
 
     func rename(id: String, to name: String, fail: Bool = false) async throws -> String {
@@ -69,33 +77,43 @@ final class TestUser {
 }
 
 extension TestUser: QueryModel {
-    struct SyncContext: Sendable {
+    struct Context: Sendable {
         let server: FakeServer
         var saves = true
+        var streams = false
     }
 
-    struct SyncState: Codable, Equatable {
+    struct State: Codable, Equatable {
         var etag: Int?
     }
 
-    static var defaultState: SyncState { .init(etag: nil) }
     static var cache: QueryCache { .forever() }
 
     static func fetch(
         context: ModelContext,
-        syncContext: SyncContext,
-        syncState: inout SyncState
-    ) async throws -> Task<Void, Never>? {
-        let response = try await syncContext.server.list(etag: syncState.etag)
+        fetchContext: Context,
+        state: State?
+    ) async throws -> State {
+        let response = try await fetchContext.server.list(etag: state?.etag)
         try context.delete(model: TestUser.self)
         for (id, name) in response.users {
             context.insert(TestUser(id: id, name: name))
         }
-        if syncContext.saves {
+        if fetchContext.saves {
             try context.save()
         }
-        syncState.etag = response.etag
-        return await syncContext.server.makeStream()
+        return State(etag: response.etag)
+    }
+
+    static func subscribe(
+        container: ModelContainer,
+        fetchContext: Context,
+        state: State?,
+        writer: StateWriter<State>
+    ) -> Task<Void, Never>? {
+        guard fetchContext.streams else { return nil }
+        let server = fetchContext.server
+        return Task { await server.stream() }
     }
 
     static func evict(context: ModelContext) throws {
@@ -110,38 +128,39 @@ final class TestPost {
 }
 
 extension TestPost: QueryModel {
-    typealias SyncContext = Void
-    struct SyncState: Codable {}
-    static var defaultState: SyncState { .init() }
     static var cache: QueryCache { .swr() }
-    static func fetch(context: ModelContext, syncContext: Void, syncState: inout SyncState) async throws -> Task<Void, Never>? {
-        nil
-    }
+    static func fetch(context: ModelContext, fetchContext: Void, state: Int?) async throws -> Int { 0 }
 }
 
 @MainActor
 func makeContainer() throws -> ModelContainer {
     try ModelContainer(
-        for: TestUser.self, TestPost.self, TestFeed.self, TestNote.self, QueryRecord.self,
+        for: TestUser.self, TestPost.self, TestFeed.self, TestNote.self, TestProfile.self, QueryRecord.self,
         configurations: ModelConfiguration(UUID().uuidString, isStoredInMemoryOnly: true)
     )
 }
+
+typealias UsersClient = ModelQueryClient<ModelFetcher<TestUser>>
 
 @MainActor
 func makeProvider(
     _ container: ModelContainer? = nil,
     server: FakeServer = FakeServer(),
-    saves: Bool = true
-) throws -> (QueryProvider, ModelQueryClient<TestUser>, FakeServer) {
+    saves: Bool = true,
+    streams: Bool = false,
+    gracePeriod: Duration = .seconds(300)
+) throws -> (QueryProvider, UsersClient, FakeServer) {
     let provider = QueryProvider(
         modelContainer: try container ?? makeContainer(),
-        for: .model(TestUser.self, .init(server: server, saves: saves))
+        contexts: TestUser.Context(server: server, saves: saves, streams: streams),
+        fetchers: TestUser.self, TestDetail.self,
+        gracePeriod: gracePeriod
     )
     return (provider, provider.client(for: TestUser.self), server)
 }
 
 @MainActor
-func localUsers(_ client: ModelQueryClient<TestUser>) throws -> [String: String] {
+func localUsers(_ client: UsersClient) throws -> [String: String] {
     let users = try client.modelContainer.mainContext.fetch(FetchDescriptor<TestUser>())
     return Dictionary(uniqueKeysWithValues: users.map { ($0.id, $0.name) })
 }
@@ -224,28 +243,135 @@ final class TestNote {
 struct EvictionError: Error {}
 
 extension TestNote: QueryModel {
-    struct SyncContext: Sendable {
+    struct Context: Sendable {
         let server: FakeServer
     }
-    struct SyncState: Codable, Equatable {
+    struct State: Codable, Equatable {
         var etag: Int?
     }
-    static var defaultState: SyncState { .init() }
     static var cache: QueryCache { .forever() }
 
     static func fetch(
         context: ModelContext,
-        syncContext: SyncContext,
-        syncState: inout SyncState
-    ) async throws -> Task<Void, Never>? {
-        let response = try await syncContext.server.list(etag: syncState.etag)
+        fetchContext: Context,
+        state: State?
+    ) async throws -> State {
+        let response = try await fetchContext.server.list(etag: state?.etag)
         try context.delete(model: TestNote.self)
         context.insert(TestNote(text: "note"))
-        syncState.etag = response.etag
-        return nil
+        return State(etag: response.etag)
     }
 
     static func evict(context: ModelContext) throws {
         throw EvictionError()
     }
+}
+
+/// A row a fetcher writes, owned by that fetcher's key.
+@Model
+final class TestProfile {
+    var userID: String
+    var bio: String
+    init(userID: String, bio: String) {
+        self.userID = userID
+        self.bio = bio
+    }
+}
+
+/// A persisted fetcher key: one user's profile, tagged with the users collection.
+struct TestDetail: QueryFetcher {
+    let id: String
+
+    struct State: Codable, Equatable {
+        var version = 0
+    }
+
+    var cache: QueryCache? { .swr(staleTime: .seconds(3600)) }
+    var tags: Set<String> { ["users", "user-\(id)"] }
+
+    func fetch(context: ModelContext, fetchContext: TestUser.Context, state: State?) async throws -> State {
+        let id = id
+        let response = try await fetchContext.server.list(etag: nil)
+        try context.delete(model: TestProfile.self, where: #Predicate { $0.userID == id })
+        context.insert(TestProfile(userID: id, bio: response.users[id] ?? "unknown"))
+        return State(version: response.etag)
+    }
+
+    func subscribe(
+        container: ModelContainer,
+        fetchContext: TestUser.Context,
+        state: State?,
+        writer: StateWriter<State>
+    ) -> Task<Void, Never>? {
+        guard fetchContext.streams else { return nil }
+        let server = fetchContext.server
+        return Task { await server.stream() }
+    }
+
+    func evict(context: ModelContext) throws {
+        let id = id
+        try context.delete(model: TestProfile.self, where: #Predicate { $0.userID == id })
+    }
+}
+
+/// A source of rates, registered by protocol type.
+protocol RateSource: Sendable {
+    func rate(from: String, to: String) async throws -> Double
+}
+
+actor FakeRates: RateSource {
+    nonisolated let checkpoints = Checkpoints()
+    private(set) var requests: [String] = []
+    private var failures = 0
+
+    func failNext() { failures += 1 }
+
+    func rate(from: String, to: String) async throws -> Double {
+        requests.append("\(from)-\(to)")
+        await checkpoints.pass("rate")
+        if failures > 0 {
+            failures -= 1
+            throw ServerError()
+        }
+        return Double(requests.count)
+    }
+}
+
+/// An in-memory fetcher whose state is the data itself.
+struct TestRate: QueryFetcher {
+    let from: String
+    let to: String
+    var cache: QueryCache? { nil }
+
+    func fetch(context: ModelContext, fetchContext: any RateSource, state: Double?) async throws -> Double {
+        try await fetchContext.rate(from: from, to: to)
+    }
+}
+
+/// A persisted fetcher whose state is the data itself.
+struct TestStoredRate: QueryFetcher {
+    let from: String
+    var cache: QueryCache? { .forever() }
+    var tags: Set<String> { ["rates"] }
+
+    func fetch(context: ModelContext, fetchContext: any RateSource, state: Double?) async throws -> Double {
+        try await fetchContext.rate(from: from, to: "EUR")
+    }
+}
+
+/// A context the provider builds itself.
+struct DefaultCounter: DefaultFetchContext {
+    let value = 7
+}
+
+struct TestDefaulted: QueryFetcher {
+    var cache: QueryCache? { nil }
+    func fetch(context: ModelContext, fetchContext: DefaultCounter, state: Int?) async throws -> Int {
+        fetchContext.value
+    }
+}
+
+extension QueryModel {
+    /// The model's record key.
+    static var queryKey: String { String(reflecting: Self.self) }
 }

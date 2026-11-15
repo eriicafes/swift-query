@@ -1,5 +1,5 @@
-/// The synchronization state of a model, carrying its ``SyncedModel/SyncState``.
-public enum QueryState<Value> {
+/// The synchronization state of a key, carrying its ``QueryFetcher/State``.
+public enum QueryStatus<Value> {
     /// No successful synchronization metadata is available.
     case pending
     /// Synchronized successfully. `stale` is `true` when a refresh is required or the last refresh failed.
@@ -28,10 +28,10 @@ public enum QueryState<Value> {
     }
 }
 
-extension QueryState: Sendable where Value: Sendable {}
+extension QueryStatus: Sendable where Value: Sendable {}
 
-/// The fetch activity of a model, independent of its ``QueryState``.
-public enum QueryFetchState: Sendable, Hashable {
+/// The fetch activity of a model, independent of its ``QueryStatus``.
+public enum QueryFetchStatus: Sendable, Hashable {
     /// No fetch is running.
     case idle
     /// The initial synchronization is running.

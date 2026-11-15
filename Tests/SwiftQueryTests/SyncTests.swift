@@ -9,14 +9,14 @@ struct SyncTests {
     @Test("Initial sync fetches and publishes success")
     func initialSync() async throws {
         let (_, client, server) = try makeProvider()
-        #expect(client.state.isPending)
+        #expect(client.status.isPending)
 
         client.sync()
         await client.settle()
 
-        #expect(client.state.value == .init(etag: 1))
-        #expect(client.state.isStale == false)
-        #expect(client.fetchState == .idle)
+        #expect(client.status.value == .init(etag: 1))
+        #expect(client.status.isStale == false)
+        #expect(client.fetchStatus == .idle)
         #expect(client.error == nil)
         #expect(await server.fetchCount == 1)
         #expect(try localUsers(client) == ["1": "Ada", "2": "Grace"])
@@ -43,24 +43,24 @@ struct SyncTests {
         #expect(await server.fetchCount == 1)
     }
 
-    @Test("Loading then fetching fetch states")
-    func fetchStates() async throws {
+    @Test("Loading then fetching fetch statuses")
+    func fetchStatuses() async throws {
         let (_, client, server) = try makeProvider()
         await server.checkpoints.hold("fetch")
 
         client.sync()
         await server.checkpoints.reached("fetch")
-        #expect(client.fetchState == .loading)
+        #expect(client.fetchStatus == .loading)
         await server.checkpoints.release("fetch")
         await client.settle()
 
         await server.checkpoints.hold("fetch")
         let refresh = Task { await client.refresh() }
         await server.checkpoints.reached("fetch", count: 2)
-        #expect(client.fetchState == .fetching)
+        #expect(client.fetchStatus == .fetching)
         await server.checkpoints.release("fetch")
         await refresh.value
-        #expect(client.fetchState == .idle)
+        #expect(client.fetchStatus == .idle)
     }
 
     @Test(".forever() reuses the cache; refresh() always fetches")
@@ -75,7 +75,7 @@ struct SyncTests {
 
         await client.refresh()
         #expect(await server.fetchCount == 2)
-        #expect(client.state.value == .init(etag: 2))
+        #expect(client.status.value == .init(etag: 2))
     }
 
     @Test("refreshAfter makes data stale")
@@ -101,13 +101,13 @@ struct SyncTests {
 
         client.invalidate()
         await client.settle()
-        #expect(client.state.isStale)
+        #expect(client.status.isStale)
         #expect(await server.fetchCount == 1)
 
         client.sync()
         await client.settle()
         #expect(await server.fetchCount == 2)
-        #expect(client.state.isStale == false)
+        #expect(client.status.isStale == false)
     }
 
     @Test("Invalidation during a fetch survives that fetch")
@@ -121,12 +121,12 @@ struct SyncTests {
         await client.settleOperations()
         await server.checkpoints.release("fetch")
         await client.settle()
-        #expect(client.state.isStale)
+        #expect(client.status.isStale)
 
         client.sync()
         await client.settle()
         #expect(await server.fetchCount == 2)
-        #expect(client.state.isStale == false)
+        #expect(client.status.isStale == false)
     }
 
     @Test("Initial failure is an error; later failures keep stale success")
@@ -136,18 +136,18 @@ struct SyncTests {
         await server.failNextFetch()
         client.sync()
         await client.settle()
-        #expect(client.state.isError)
+        #expect(client.status.isError)
         #expect(client.error is ServerError)
 
         client.sync()
         await client.settle()
-        #expect(client.state.value == .init(etag: 1))
+        #expect(client.status.value == .init(etag: 1))
         #expect(client.error == nil)
 
         await server.failNextFetch()
         await client.refresh()
-        #expect(client.state.value == .init(etag: 1))
-        #expect(client.state.isStale)
+        #expect(client.status.value == .init(etag: 1))
+        #expect(client.status.isStale)
         #expect(client.error is ServerError)
         #expect(try localUsers(client) == ["1": "Ada", "2": "Grace"])
     }
@@ -163,7 +163,7 @@ struct SyncTests {
         }
 
         let (_, client, _) = try makeProvider(container, server: server)
-        #expect(client.state.value == .init(etag: 1))
+        #expect(client.status.value == .init(etag: 1))
 
         client.sync()
         await client.settle()
@@ -173,26 +173,40 @@ struct SyncTests {
         #expect(await server.requestedEtags == [nil, 1])
     }
 
-    @Test("Returned stream tasks are replaced and cancelled")
-    func streams() async throws {
-        let (_, client, server) = try makeProvider()
-        await server.setStreaming(true)
+    @Test("A view starts the stream once; fetches alone never do")
+    func subscribeOnAttach() async throws {
+        let (_, client, server) = try makeProvider(streams: true)
+        await client.refresh()
+        #expect(await server.streamsStarted == 0)
 
+        let first = Subscription<ModelFetcher<TestUser>>()
+        let second = Subscription<ModelFetcher<TestUser>>()
+        first.activate(client, cache: nil)
+        second.activate(client, cache: nil)
+        await client.settle()
         await client.refresh()
-        await client.refresh()
-        var streams = await server.streams
-        #expect(streams.count == 2)
-        #expect(streams[0].isCancelled)
-        #expect(!streams[1].isCancelled)
+        await eventually { await server.streamsStarted == 1 }
+        #expect(await client.subscriptions() == 1)
+    }
 
-        await server.setStreaming(false)
-        await client.refresh()
-        streams = await server.streams
-        #expect(!streams[1].isCancelled)
+    @Test("A cancelled stream restarts on the next sync from a view")
+    func streamRestarts() async throws {
+        let (_, client, server) = try makeProvider(streams: true)
+        let subscription = Subscription<ModelFetcher<TestUser>>()
+        subscription.activate(client, cache: nil)
+        await client.settle()
+        await eventually { await server.streamsStarted == 1 }
 
         client.cancelStream()
+        await client.settleOperations()
+        await eventually { await server.streamsEnded == 1 }
+        #expect(await client.isStreaming() == false)
+
+        // The scene becoming active again syncs, which restarts the stream.
+        subscription.activate(client, cache: nil, phase: .background)
+        subscription.activate(client, cache: nil, phase: .active)
         await client.settle()
-        #expect(streams[1].isCancelled)
+        await eventually { await server.streamsStarted == 2 }
     }
 
     @Test("Expired SWR cache is evicted and refetched from default state")
@@ -205,13 +219,13 @@ struct SyncTests {
         await client.settle()
 
         #expect(await server.requestedEtags == [nil, nil])
-        #expect(client.state.value == .init(etag: 2))
+        #expect(client.status.value == .init(etag: 2))
     }
 
     @Test("Observed caches are not evicted")
     func observedNotEvicted() async throws {
         let (_, client, server) = try makeProvider()
-        let subscription = Subscription<TestUser>()
+        let subscription = Subscription<ModelFetcher<TestUser>>()
         subscription.activate(client, cache: nil)
         subscription.activate(client, cache: nil)
         await client.settle()
@@ -231,12 +245,12 @@ struct SyncTests {
         try container.mainContext.save()
 
         let (_, client, server) = try makeProvider(container)
-        #expect(client.state.isPending)
+        #expect(client.status.isPending)
 
         client.sync()
         await client.settle()
         #expect(await server.requestedEtags == [nil])
-        #expect(client.state.value == .init(etag: 1))
+        #expect(client.status.value == .init(etag: 1))
     }
 
     @Test("Changes left unsaved by fetch are saved")
@@ -269,7 +283,7 @@ struct SyncTests {
     @Test("Scene activation re-syncs; body re-evaluations don't")
     func sceneActivation() async throws {
         let (_, client, server) = try makeProvider()
-        let subscription = Subscription<TestUser>()
+        let subscription = Subscription<ModelFetcher<TestUser>>()
         let cache = QueryCache.forever(refreshAfter: .zero)
 
         subscription.activate(client, cache: cache, phase: .active)
@@ -287,7 +301,7 @@ struct SyncTests {
     @Test("Duplicate query records collapse to the most recently synced")
     func duplicateRecords() async throws {
         let container = try makeContainer()
-        let state = try JSONEncoder().encode(TestUser.SyncState(etag: 5))
+        let state = try JSONEncoder().encode(TestUser.State(etag: 5))
         container.mainContext.insert(QueryRecord(key: TestUser.queryKey))
         container.mainContext.insert(QueryRecord(key: TestUser.queryKey, stateData: state, lastSyncedAt: .now))
         try container.mainContext.save()
@@ -296,7 +310,7 @@ struct SyncTests {
         client.sync()
         await client.settle()
 
-        #expect(client.state.value == .init(etag: 5))
+        #expect(client.status.value == .init(etag: 5))
         #expect(await server.fetchCount == 0)
         let records = try container.mainContext.fetch(FetchDescriptor<QueryRecord>())
         #expect(records.count == 1)
@@ -308,15 +322,15 @@ struct SyncTests {
         client.sync()
         await client.settle()
 
-        let state = Flag(), error = Flag(), fetchState = Flag()
-        withObservationTracking { _ = client.state } onChange: { state.value = true }
+        let state = Flag(), error = Flag(), fetchStatus = Flag()
+        withObservationTracking { _ = client.status } onChange: { state.value = true }
         withObservationTracking { _ = client.error } onChange: { error.value = true }
-        withObservationTracking { _ = client.fetchState } onChange: { fetchState.value = true }
+        withObservationTracking { _ = client.fetchStatus } onChange: { fetchStatus.value = true }
         client.sync()
         await client.settle()
         #expect(state.value == false)
         #expect(error.value == false)
-        #expect(fetchState.value == false)
+        #expect(fetchStatus.value == false)
     }
 
     @Test("Access time is written at most once per resolution window")
@@ -341,7 +355,8 @@ struct SyncTests {
         let server = FakeServer()
         let provider = QueryProvider(
             modelContainer: try makeContainer(),
-            for: .model(TestNote.self, .init(server: server))
+            contexts: TestNote.Context(server: server),
+            fetchers: TestNote.self
         )
         let client = provider.client(for: TestNote.self)
         await client.refresh()
@@ -355,6 +370,6 @@ struct SyncTests {
         client.sync()
         await client.settle()
         #expect(await server.requestedEtags == [nil, nil])
-        #expect(client.state.value == .init(etag: 2))
+        #expect(client.status.value == .init(etag: 2))
     }
 }

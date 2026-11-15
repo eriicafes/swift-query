@@ -35,18 +35,19 @@ public enum QueryCache: Sendable, Hashable {
 
     func isStale(lastSyncedAt: Date, now: Date) -> Bool {
         guard let staleTime else { return false }
-        return now >= lastSyncedAt.addingTimeInterval(staleTime.timeInterval)
+        return now >= lastSyncedAt.addingTimeInterval(staleTime / .seconds(1))
     }
 
     func isExpired(lastAccessedAt: Date, now: Date) -> Bool {
         guard let cacheTime else { return false }
-        return now >= lastAccessedAt.addingTimeInterval(cacheTime.timeInterval)
+        return now >= lastAccessedAt.addingTimeInterval(cacheTime / .seconds(1))
     }
 }
 
-extension Duration {
-    var timeInterval: TimeInterval {
-        let (seconds, attoseconds) = components
-        return TimeInterval(seconds) + TimeInterval(attoseconds) / 1e18
-    }
+/// How old cached state may be before ``QueryProvider/query(_:staleTime:)`` fetches again.
+public enum StaleTime: Sendable, Hashable {
+    /// Stale once older than the duration. `.after(.zero)` always fetches.
+    case after(Duration)
+    /// Never stale: any cached state is returned unless it was invalidated.
+    case infinite
 }
