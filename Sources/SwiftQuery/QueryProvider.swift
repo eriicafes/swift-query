@@ -166,21 +166,32 @@ public final class QueryProvider {
 
     /// The current status of a key, without creating a client or fetching. Uses the live client
     /// if there is one (observable in views), otherwise the stored state (a snapshot).
-    public func status<F: QueryFetcher>(for fetcher: F) -> QueryStatus<F.State> {
+    public func getQueryState<F: QueryFetcher>(for fetcher: F) -> QueryState<F.QueryData> {
         if let live = clients[AnyHashable(fetcher)]?.client as? ModelQueryClient<F> {
-            return live.status
+            return live.state
         }
         guard fetcher.cache != nil,
               let (value, _, stale) = ModelQueryClient<F>.storedState(
                 fetcher, key: QueryRecord.Key.make(fetcher), in: modelContainer.mainContext
               )
         else { return .pending }
-        return .success(value: value, stale: stale)
+        return .success(data: value, stale: stale)
     }
 
-    /// The current status of a model collection. See ``status(for:)-(F)``.
-    public func status<M: QueryModel>(for model: M.Type) -> QueryStatus<M.State> {
-        status(for: ModelFetcher<M>())
+    /// The current status of a model collection. See ``getQueryState(for:)-(F)``.
+    public func getQueryState<M: QueryModel>(for model: M.Type) -> QueryState<M.QueryData> {
+        getQueryState(for: ModelFetcher<M>())
+    }
+
+    /// The key's data, without creating a client or fetching. Shorthand for
+    /// `getQueryState(for:).data`.
+    public func getQueryData<F: QueryFetcher>(for fetcher: F) -> F.QueryData? {
+        getQueryState(for: fetcher).data
+    }
+
+    /// ``getQueryData(for:)-(F)`` for a model collection.
+    public func getQueryData<M: QueryModel>(for model: M.Type) -> M.QueryData? {
+        getQueryData(for: ModelFetcher<M>())
     }
 
     /// Returns the key's state if it is fresh, otherwise fetches it and returns the result.
@@ -189,13 +200,13 @@ public final class QueryProvider {
     /// policy, `.infinite` accepts any cached state, `.after(.zero)` always fetches. Joins a fetch
     /// already in flight. Throws when the fetch fails.
     @discardableResult
-    public func query<F: QueryFetcher>(_ fetcher: F, staleTime: StaleTime? = nil) async throws -> F.State {
+    public func query<F: QueryFetcher>(_ fetcher: F, staleTime: StaleTime? = nil) async throws -> F.QueryData {
         try await client(for: fetcher).query(staleTime: staleTime)
     }
 
     /// ``query(_:staleTime:)-(F,_)`` for a model collection.
     @discardableResult
-    public func query<M: QueryModel>(_ model: M.Type, staleTime: StaleTime? = nil) async throws -> M.State {
+    public func query<M: QueryModel>(_ model: M.Type, staleTime: StaleTime? = nil) async throws -> M.QueryData {
         try await query(ModelFetcher<M>(), staleTime: staleTime)
     }
 
@@ -212,13 +223,13 @@ public final class QueryProvider {
 
     /// Replaces a key's state as if a fetch had just returned it, for example with a
     /// mutation's response. The state counts as fresh.
-    public func setState<F: QueryFetcher>(for fetcher: F, _ state: F.State) async throws {
-        try await client(for: fetcher).setState(state)
+    public func setQueryData<F: QueryFetcher>(for fetcher: F, _ data: F.QueryData) async throws {
+        try await client(for: fetcher).setQueryData(data)
     }
 
-    /// ``setState(for:_:)-(F,_)`` for a model collection.
-    public func setState<M: QueryModel>(for model: M.Type, _ state: M.State) async throws {
-        try await setState(for: ModelFetcher<M>(), state)
+    /// ``setQueryData(for:_:)-(F,_)`` for a model collection.
+    public func setQueryData<M: QueryModel>(for model: M.Type, _ data: M.QueryData) async throws {
+        try await setQueryData(for: ModelFetcher<M>(), data)
     }
 
     // MARK: Bulk operations
@@ -279,7 +290,7 @@ public final class QueryProvider {
         let liveKeys = Set(liveClients.map(\.recordKey))
         let context = bookkeepingContext()
         let records = (try? context.fetch(FetchDescriptor<QueryRecord>(
-            predicate: #Predicate { $0.cacheTime != nil && $0.stateData != nil }
+            predicate: #Predicate { $0.gcTime != nil && $0.stateData != nil }
         ))) ?? []
         let now = Date.now
         for record in records where !liveKeys.contains(record.key) && record.isExpired(now: now) {

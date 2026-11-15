@@ -57,7 +57,7 @@ struct MutationTests {
 
         await #expect(throws: ServerError.self) { try await mutation.value }
         #expect(try localUsers(client)["1"] == "Ada")
-        #expect(client.status.isError == false)
+        #expect(client.state.isError == false)
         #expect(client.error == nil)
         #expect(await server.fetchCount == 1)
     }
@@ -74,7 +74,7 @@ struct MutationTests {
         #expect(result == "Ada L.")
         #expect(try localUsers(client)["1"] == "Ada L.")
         #expect(client.error is ServerError)
-        #expect(client.status.isStale)
+        #expect(client.state.isStale)
     }
 
     @Test("An older failed mutation does not roll back a newer change")

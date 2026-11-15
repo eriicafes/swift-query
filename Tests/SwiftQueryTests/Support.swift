@@ -83,7 +83,7 @@ extension TestUser: QueryModel {
         var streams = false
     }
 
-    struct State: Codable, Equatable {
+    struct QueryData: Codable, Equatable {
         var etag: Int?
     }
 
@@ -92,9 +92,9 @@ extension TestUser: QueryModel {
     static func fetch(
         context: ModelContext,
         fetchContext: Context,
-        state: State?
-    ) async throws -> State {
-        let response = try await fetchContext.server.list(etag: state?.etag)
+        previous: QueryData?
+    ) async throws -> QueryData {
+        let response = try await fetchContext.server.list(etag: previous?.etag)
         try context.delete(model: TestUser.self)
         for (id, name) in response.users {
             context.insert(TestUser(id: id, name: name))
@@ -102,14 +102,14 @@ extension TestUser: QueryModel {
         if fetchContext.saves {
             try context.save()
         }
-        return State(etag: response.etag)
+        return QueryData(etag: response.etag)
     }
 
     static func subscribe(
         container: ModelContainer,
         fetchContext: Context,
-        state: State?,
-        writer: StateWriter<State>
+        previous: QueryData?,
+        writer: QueryDataWriter<QueryData>
     ) -> Task<Void, Never>? {
         guard fetchContext.streams else { return nil }
         let server = fetchContext.server
@@ -129,7 +129,7 @@ final class TestPost {
 
 extension TestPost: QueryModel {
     static var cache: QueryCache { .swr() }
-    static func fetch(context: ModelContext, fetchContext: Void, state: Int?) async throws -> Int { 0 }
+    static func fetch(context: ModelContext, fetchContext: Void, previous: Int?) async throws -> Int { 0 }
 }
 
 @MainActor
@@ -246,7 +246,7 @@ extension TestNote: QueryModel {
     struct Context: Sendable {
         let server: FakeServer
     }
-    struct State: Codable, Equatable {
+    struct QueryData: Codable, Equatable {
         var etag: Int?
     }
     static var cache: QueryCache { .forever() }
@@ -254,12 +254,12 @@ extension TestNote: QueryModel {
     static func fetch(
         context: ModelContext,
         fetchContext: Context,
-        state: State?
-    ) async throws -> State {
-        let response = try await fetchContext.server.list(etag: state?.etag)
+        previous: QueryData?
+    ) async throws -> QueryData {
+        let response = try await fetchContext.server.list(etag: previous?.etag)
         try context.delete(model: TestNote.self)
         context.insert(TestNote(text: "note"))
-        return State(etag: response.etag)
+        return QueryData(etag: response.etag)
     }
 
     static func evict(context: ModelContext) throws {
@@ -282,26 +282,26 @@ final class TestProfile {
 struct TestDetail: QueryFetcher {
     let id: String
 
-    struct State: Codable, Equatable {
+    struct QueryData: Codable, Equatable {
         var version = 0
     }
 
     var cache: QueryCache? { .swr(staleTime: .seconds(3600)) }
     var tags: Set<String> { ["users", "user-\(id)"] }
 
-    func fetch(context: ModelContext, fetchContext: TestUser.Context, state: State?) async throws -> State {
+    func fetch(context: ModelContext, fetchContext: TestUser.Context, previous: QueryData?) async throws -> QueryData {
         let id = id
         let response = try await fetchContext.server.list(etag: nil)
         try context.delete(model: TestProfile.self, where: #Predicate { $0.userID == id })
         context.insert(TestProfile(userID: id, bio: response.users[id] ?? "unknown"))
-        return State(version: response.etag)
+        return QueryData(version: response.etag)
     }
 
     func subscribe(
         container: ModelContainer,
         fetchContext: TestUser.Context,
-        state: State?,
-        writer: StateWriter<State>
+        previous: QueryData?,
+        writer: QueryDataWriter<QueryData>
     ) -> Task<Void, Never>? {
         guard fetchContext.streams else { return nil }
         let server = fetchContext.server
@@ -343,7 +343,7 @@ struct TestRate: QueryFetcher {
     let to: String
     var cache: QueryCache? { nil }
 
-    func fetch(context: ModelContext, fetchContext: any RateSource, state: Double?) async throws -> Double {
+    func fetch(context: ModelContext, fetchContext: any RateSource, previous: Double?) async throws -> Double {
         try await fetchContext.rate(from: from, to: to)
     }
 }
@@ -354,7 +354,7 @@ struct TestStoredRate: QueryFetcher {
     var cache: QueryCache? { .forever() }
     var tags: Set<String> { ["rates"] }
 
-    func fetch(context: ModelContext, fetchContext: any RateSource, state: Double?) async throws -> Double {
+    func fetch(context: ModelContext, fetchContext: any RateSource, previous: Double?) async throws -> Double {
         try await fetchContext.rate(from: from, to: "EUR")
     }
 }
@@ -366,7 +366,7 @@ struct DefaultCounter: DefaultFetchContext {
 
 struct TestDefaulted: QueryFetcher {
     var cache: QueryCache? { nil }
-    func fetch(context: ModelContext, fetchContext: DefaultCounter, state: Int?) async throws -> Int {
+    func fetch(context: ModelContext, fetchContext: DefaultCounter, previous: Int?) async throws -> Int {
         fetchContext.value
     }
 }

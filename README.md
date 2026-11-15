@@ -47,24 +47,24 @@ A `QueryModel` syncs a whole SwiftData collection. The model type is the key.
 
 ```swift
 extension User: QueryModel {
-    struct State: Codable {
+    struct QueryData: Codable {
         var etag: String?
     }
 
     static var cache: QueryCache { .swr(staleTime: .seconds(30)) }
 
-    static func fetch(context: ModelContext, fetchContext: APIClient, state: State?) async throws -> State {
-        let response = try await fetchContext.users(etag: state?.etag)
-        guard let users = response.users else { return state ?? State() } // 304
+    static func fetch(context: ModelContext, fetchContext: APIClient, previous: QueryData?) async throws -> QueryData {
+        let response = try await fetchContext.users(etag: previous?.etag)
+        guard let users = response.users else { return previous ?? QueryData() } // 304
         try upsert(users, into: context) // your own insert/update logic
-        return State(etag: response.etag)
+        return QueryData(etag: response.etag)
     }
 }
 ```
 
 - `fetch` writes rows into `context`, a fresh context per fetch. Pending changes are saved when it returns and discarded if it throws.
-- `state` is what the last successful fetch returned, or `nil` before the first one. Return the new state; it's saved after a successful fetch.
-- `Context` (your dependencies) and `State` (any `Codable` value) are inferred from `fetch`.
+- `previous` is what the last successful fetch returned, or `nil` before the first one. Return the new data; it's saved after a successful fetch.
+- `Context` (your dependencies) and `QueryData` (any `Codable` value) are inferred from `fetch`.
 - Only `fetch` and `cache` are required. `tags`, `subscribe` and `evict` are optional.
 
 ## Fetchers
@@ -79,7 +79,7 @@ struct UserDetail: QueryFetcher {
     var cache: QueryCache? { .swr(staleTime: .seconds(30)) }
     var tags: Set<String> { ["users", "user-\(id)"] }
 
-    func fetch(context: ModelContext, fetchContext: APIClient, state: Date?) async throws -> Date {
+    func fetch(context: ModelContext, fetchContext: APIClient, previous: Date?) async throws -> Date {
         let dto = try await fetchContext.profile(userID: id)
         // create or update the User row and its profile
         return .now
@@ -87,14 +87,14 @@ struct UserDetail: QueryFetcher {
 }
 ```
 
-Or return a value that has no model of its own. SwiftQuery stores it as the fetcher's `State`, in its own `QueryRecord` table, or only in memory when `cache` is `nil`:
+Or return a value that has no model of its own. SwiftQuery stores it as the fetcher's `QueryData`, in its own `QueryRecord` table, or only in memory when `cache` is `nil`:
 
 ```swift
 struct ExchangeRate: QueryFetcher {
     let from: String, to: String
     var cache: QueryCache? { .swr(staleTime: .seconds(60)) }
 
-    func fetch(context: ModelContext, fetchContext: APIClient, state: Double?) async throws -> Double {
+    func fetch(context: ModelContext, fetchContext: APIClient, previous: Double?) async throws -> Double {
         try await fetchContext.rate(from, to)
     }
 }
@@ -111,7 +111,7 @@ Common detail queries, all keyed by a row's id:
 | Extra fields on a row | Columns the list doesn't return | Clears those fields |
 | A related model | A model attached with `.cascade` | Nothing; deleted with the row |
 | Rows the fetcher owns | Top-level rows only this key uses | Deletes its own rows |
-| A standalone value | Only its `State` | Nothing |
+| A standalone value | Only its `QueryData` | Nothing |
 
 Have each one create or update the row from its own response, so it works before the collection has loaded, for example from a deep link.
 
@@ -121,26 +121,32 @@ Have each one create or update the row from its own response, so it works before
 .forever()                                    // fresh until invalidated
 .forever(refreshAfter: .seconds(300))         // stale after 5 minutes, kept forever
 .swr()                                        // stale after 5 minutes, removed after 24 hours unused
-.swr(staleTime: .seconds(30), cacheTime: .seconds(3600))
+.swr(staleTime: .seconds(30), gcTime: .seconds(3600))
 ```
 
-- A key is in use while a view shows it. `cacheTime` counts from the last use.
+- A key is in use while a view shows it. `gcTime` counts from the last use.
 - An expired key is evicted on its next sync, or by `provider.collectGarbage()`, for example when the app goes to the background. Eviction runs `evict(context:)`, which deletes nothing by default.
 - Evicting a key invalidates other keys that share one of its tags, so `UserDetail` refetches after the `User` collection is evicted.
 
-## Status
+## State
 
 ```swift
-enum QueryStatus<Value> {
+enum QueryState<QueryData> {
     case pending                            // nothing fetched yet
-    case success(value: Value, stale: Bool)
+    case success(data: QueryData, stale: Bool)
     case error(any Error)                   // failed with nothing fetched yet
 }
 
-enum QueryFetchStatus { case idle, loading, fetching }
+enum QueryFetchStatus { case idle, fetching }
 ```
 
-A client's `status` carries its `State`, and `fetchStatus` tracks fetch activity. If a refresh fails after an earlier success, `status` stays `.success(value, stale: true)` and the failure goes to `client.error`.
+A client's `state` holds its status and data, and `fetchStatus` tracks fetch activity. The names follow React Query:
+
+- `client.data` is the data from the last successful fetch.
+- `client.isLoading` is true during the first fetch; `client.isFetching` during any fetch.
+- `state.isPending`, `isSuccess`, `isError` and `isStale` describe the status.
+
+If a refresh fails after an earlier success, `state` stays `.success(data, stale: true)` and the failure goes to `client.error`.
 
 ## Provider
 
@@ -158,13 +164,14 @@ QueryProvider(
 - **`fetchers:`** lists every persisted model and fetcher type, so expired caches can be evicted even when no client exists.
 - **Clients** are created on first use. An unused fetcher client is dropped after `gracePeriod` (5 minutes), and model clients last the whole session.
 
-Reading and writing state:
+Reading and writing data:
 
 ```swift
-provider.status(for: UserDetail(id: "42"))                      // no fetch
+provider.getQueryState(for: UserDetail(id: "42"))               // no fetch
+provider.getQueryData(for: ExchangeRate(from: "USD", to: "EUR"))
 try await provider.query(ExchangeRate(from: "USD", to: "EUR"))  // cached if fresh, else fetch
 provider.prefetch(UserDetail(id: "42"))
-try await provider.setState(for: ExchangeRate(from: "USD", to: "EUR"), 0.92)
+try await provider.setQueryData(for: ExchangeRate(from: "USD", to: "EUR"), 0.92)
 ```
 
 `query` takes a `staleTime`: `.after(duration)` for a maximum age, or `.infinite` to accept any cached value.
@@ -202,7 +209,7 @@ struct UsersView: View {
     var body: some View {
         List(users) { Text($0.name) }
             .overlay {
-                if usersClient.fetchStatus == .loading { ProgressView() }
+                if usersClient.isLoading { ProgressView() }
             }
             .refreshable { await usersClient.refresh() }
     }
@@ -264,11 +271,11 @@ Implement `subscribe` to keep a stream open while a view shows the key:
 static func subscribe(
     container: ModelContainer,
     fetchContext: Context,
-    state: State?,
-    writer: StateWriter<State>
+    previous: QueryData?,
+    writer: QueryDataWriter<QueryData>
 ) -> Task<Void, Never>? {
     Task {
-        for await event in await fetchContext.socket.events(after: state?.seq ?? 0) {
+        for await event in await fetchContext.socket.events(after: previous?.seq ?? 0) {
             let context = ModelContext(container)
             context.insert(Message(event))
             try? context.save()
@@ -280,7 +287,7 @@ static func subscribe(
 
 - `subscribe` returns the task without awaiting anything itself.
 - The stream starts when a view appears and stops when its client is dropped.
-- `writer.update` advances the saved state, so the next fetch resumes after the streamed data. Keep updates monotonic, as with `max`.
+- `writer.update` advances the saved data, so the next fetch resumes after the streamed data. Keep updates monotonic, as with `max`.
 
 ## Isolation
 
@@ -326,7 +333,7 @@ final class Post {
 extension Post: QueryModel {
     static var cache: QueryCache { .swr(staleTime: .seconds(60)) }
 
-    static func fetch(context: ModelContext, fetchContext: API, state: Date?) async throws -> Date {
+    static func fetch(context: ModelContext, fetchContext: API, previous: Date?) async throws -> Date {
         for dto in try await fetchContext.posts() {
             context.insert(Post(id: dto.id, title: dto.title)) // upserts by unique id
         }
@@ -360,7 +367,7 @@ struct PostsView: View {
         NavigationStack {
             List(posts) { Text($0.title) }
                 .overlay {
-                    if client.fetchStatus == .loading { ProgressView() }
+                    if client.isLoading { ProgressView() }
                 }
                 .refreshable { await client.refresh() }
                 .navigationTitle("Posts")

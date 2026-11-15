@@ -8,7 +8,7 @@ actor FeedServer {
     /// Holds fetches in flight until a test releases them. Key: "fetch".
     nonisolated let checkpoints = Checkpoints()
     private(set) var requestedSeqs: [Int] = []
-    private(set) var writer: StateWriter<TestFeed.State>?
+    private(set) var writer: QueryDataWriter<TestFeed.QueryData>?
     private var latest: Int
     private var failures = 0
 
@@ -17,7 +17,7 @@ actor FeedServer {
     }
 
     func failNextFetch() { failures += 1 }
-    func setWriter(_ writer: StateWriter<TestFeed.State>) { self.writer = writer }
+    func setWriter(_ writer: QueryDataWriter<TestFeed.QueryData>) { self.writer = writer }
 
     func latest(after seq: Int) async throws -> Int {
         requestedSeqs.append(seq)
@@ -42,21 +42,21 @@ extension TestFeed: QueryModel {
         let server: FeedServer
     }
 
-    struct State: Codable, Equatable {
+    struct QueryData: Codable, Equatable {
         var seq = 0
     }
 
     static var cache: QueryCache { .forever() }
 
-    static func fetch(context: ModelContext, fetchContext: Context, state: State?) async throws -> State {
-        State(seq: try await fetchContext.server.latest(after: state?.seq ?? 0))
+    static func fetch(context: ModelContext, fetchContext: Context, previous: QueryData?) async throws -> QueryData {
+        QueryData(seq: try await fetchContext.server.latest(after: previous?.seq ?? 0))
     }
 
     static func subscribe(
         container: ModelContainer,
         fetchContext: Context,
-        state: State?,
-        writer: StateWriter<State>
+        previous: QueryData?,
+        writer: QueryDataWriter<QueryData>
     ) -> Task<Void, Never>? {
         let server = fetchContext.server
         return Task { await server.setWriter(writer) }
@@ -66,8 +66,8 @@ extension TestFeed: QueryModel {
 typealias FeedClient = ModelQueryClient<ModelFetcher<TestFeed>>
 
 @MainActor
-@Suite("Sync state writer")
-struct SyncStateWriterTests {
+@Suite("Query data writer")
+struct QueryDataWriterTests {
     func makeFeed(
         _ container: ModelContainer? = nil,
         server: FeedServer = FeedServer(),
@@ -86,7 +86,7 @@ struct SyncStateWriterTests {
     func connect(
         _ client: FeedClient,
         _ server: FeedServer
-    ) async throws -> (StateWriter<TestFeed.State>, Subscription<ModelFetcher<TestFeed>>) {
+    ) async throws -> (QueryDataWriter<TestFeed.QueryData>, Subscription<ModelFetcher<TestFeed>>) {
         let subscription = Subscription<ModelFetcher<TestFeed>>()
         subscription.activate(client, cache: nil)
         await client.settle()
@@ -101,15 +101,15 @@ struct SyncStateWriterTests {
         do {
             let (_, client, _) = try makeFeed(container, server: server)
             let (writer, _) = try await connect(client, server)
-            #expect(client.status.value == .init(seq: 3))
+            #expect(client.data == .init(seq: 3))
 
             await writer.update { $0.seq = max($0.seq, 7) }
-            #expect(client.status.value == .init(seq: 7))
-            #expect(client.status.isStale == false)
+            #expect(client.data == .init(seq: 7))
+            #expect(client.state.isStale == false)
         }
 
         let (_, client, _) = try makeFeed(container, server: server)
-        #expect(client.status.value == .init(seq: 7))
+        #expect(client.data == .init(seq: 7))
         await client.refresh()
         #expect(await server.requestedSeqs == [0, 7])
     }
@@ -123,11 +123,11 @@ struct SyncStateWriterTests {
         let inFlight = Task { await client.refresh() }
         await server.checkpoints.reached("fetch", count: 2)
         await writer.update { $0.seq = max($0.seq, 10) }
-        #expect(client.status.value == .init(seq: 3))
+        #expect(client.data == .init(seq: 3))
 
         await server.checkpoints.release("fetch")
         await inFlight.value
-        #expect(client.status.value == .init(seq: 10))
+        #expect(client.data == .init(seq: 10))
 
         await client.refresh()
         #expect(await server.requestedSeqs.last == 10)
@@ -146,8 +146,8 @@ struct SyncStateWriterTests {
         await server.checkpoints.release("fetch")
         await inFlight.value
 
-        #expect(client.status.value == .init(seq: 5))
-        #expect(client.status.isStale)
+        #expect(client.data == .init(seq: 5))
+        #expect(client.state.isStale)
         #expect(client.error is ServerError)
     }
 
@@ -156,10 +156,10 @@ struct SyncStateWriterTests {
         let (_, client, server) = try makeFeed()
         await server.failNextFetch()
         let (writer, _) = try await connect(client, server)
-        #expect(client.status.isError)
+        #expect(client.state.isError)
 
         await writer.update { $0.seq = 99 }
-        #expect(client.status.isError)
+        #expect(client.state.isError)
 
         await client.refresh()
         #expect(await server.requestedSeqs == [0, 0])
@@ -177,10 +177,10 @@ struct SyncStateWriterTests {
         for seq in 1...limit {
             await writer.update { $0.seq = max($0.seq, seq) }
         }
-        #expect(client.status.value == .init(seq: limit))
+        #expect(client.data == .init(seq: limit))
 
         await server.checkpoints.release("fetch")
         await inFlight.value
-        #expect(client.status.value == .init(seq: 3))
+        #expect(client.data == .init(seq: 3))
     }
 }

@@ -20,7 +20,7 @@ import SwiftData
 public final class QueryRecord {
     /// The model type's identity.
     public var key: String = ""
-    /// The encoded ``QueryFetcher/State`` from the last successful fetch.
+    /// The encoded ``QueryFetcher/QueryData`` from the last successful fetch.
     public var stateData: Data?
     /// When the last successful fetch finished.
     public var lastSyncedAt: Date?
@@ -31,7 +31,7 @@ public final class QueryRecord {
     /// The key's tags, encoded for exact `contains` matching. See ``QueryFetcher/tags``.
     public var tags: String = ""
     /// The SWR cache time in seconds, or `nil` when the cache never expires.
-    public var cacheTime: Double?
+    public var gcTime: Double?
 
     public init(
         key: String,
@@ -40,7 +40,7 @@ public final class QueryRecord {
         lastAccessedAt: Date? = nil,
         invalidated: Bool = false,
         tags: String = "",
-        cacheTime: Double? = nil
+        gcTime: Double? = nil
     ) {
         self.key = key
         self.stateData = stateData
@@ -48,7 +48,7 @@ public final class QueryRecord {
         self.lastAccessedAt = lastAccessedAt
         self.invalidated = invalidated
         self.tags = tags
-        self.cacheTime = cacheTime
+        self.gcTime = gcTime
     }
 }
 
@@ -65,12 +65,12 @@ extension QueryRecord {
 }
 
 extension QueryRecord {
-    /// Whether the record's cache expired under its stored ``cacheTime``.
+    /// Whether the record's cache expired under its stored ``gcTime``.
     func isExpired(now: Date) -> Bool {
-        guard let cacheTime, stateData != nil,
+        guard let gcTime, stateData != nil,
               let lastUse = lastAccessedAt ?? lastSyncedAt
         else { return false }
-        return now >= lastUse.addingTimeInterval(cacheTime)
+        return now >= lastUse.addingTimeInterval(gcTime)
     }
 }
 

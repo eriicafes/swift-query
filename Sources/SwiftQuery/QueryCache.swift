@@ -11,10 +11,10 @@ public enum QueryCache: Sendable, Hashable {
     /// Stale-while-revalidate: stale data stays available while a background fetch updates SwiftData.
     ///
     /// Data becomes stale `staleTime` after the last successful fetch, and is eligible for
-    /// garbage collection once it has gone unused for `cacheTime`.
+    /// garbage collection once it has gone unused for `gcTime`.
     case swr(
         staleTime: Duration = .seconds(5 * 60),
-        cacheTime: Duration = .seconds(24 * 60 * 60)
+        gcTime: Duration = .seconds(24 * 60 * 60)
     )
 
     /// The time after a successful fetch at which data becomes stale, if any.
@@ -26,10 +26,10 @@ public enum QueryCache: Sendable, Hashable {
     }
 
     /// The inactivity time after which cached data may be garbage collected, if any.
-    public var cacheTime: Duration? {
+    public var gcTime: Duration? {
         switch self {
         case .forever: nil
-        case .swr(_, let cacheTime): cacheTime
+        case .swr(_, let gcTime): gcTime
         }
     }
 
@@ -39,8 +39,8 @@ public enum QueryCache: Sendable, Hashable {
     }
 
     func isExpired(lastAccessedAt: Date, now: Date) -> Bool {
-        guard let cacheTime else { return false }
-        return now >= lastAccessedAt.addingTimeInterval(cacheTime / .seconds(1))
+        guard let gcTime else { return false }
+        return now >= lastAccessedAt.addingTimeInterval(gcTime / .seconds(1))
     }
 }
 

@@ -2,4 +2,4 @@
 "swift-query": minor
 ---
 
-Added streams with `StateWriter`
+Added streams with `QueryDataWriter`

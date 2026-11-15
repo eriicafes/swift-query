@@ -8,13 +8,13 @@ import SwiftData
 ///
 /// ```swift
 /// extension User: QueryModel {
-///     struct State: Codable { var etag: String? }
+///     struct QueryData: Codable { var etag: String? }
 ///     static var cache: QueryCache { .forever(refreshAfter: .seconds(5 * 60)) }
 ///     static var tags: Set<String> { ["users"] }
 ///
-///     static func fetch(context: ModelContext, fetchContext: APIClient, state: State?) async throws -> State {
-///         // fetch with state?.etag, write into `context`
-///         return State(etag: newETag)
+///     static func fetch(context: ModelContext, fetchContext: APIClient, previous: QueryData?) async throws -> QueryData {
+///         // fetch with previous?.etag, write into `context`
+///         return QueryData(etag: newETag)
 ///     }
 /// }
 /// ```
@@ -22,7 +22,7 @@ public protocol QueryModel: PersistentModel, Queryable {
     /// Runtime dependencies, resolved by type from the provider's `contexts:`.
     associatedtype Context: Sendable
     /// Sync metadata such as ETags or cursors, persisted between launches.
-    associatedtype State: Codable
+    associatedtype QueryData: Codable
 
     /// The default cache policy. Models are always persisted.
     static var cache: QueryCache { get }
@@ -31,14 +31,14 @@ public protocol QueryModel: PersistentModel, Queryable {
     static var tags: Set<String> { get }
 
     /// Fetches the collection into `context`. See ``QueryFetcher/fetch(context:fetchContext:state:)``.
-    static func fetch(context: ModelContext, fetchContext: Context, state: State?) async throws -> State
+    static func fetch(context: ModelContext, fetchContext: Context, previous: QueryData?) async throws -> QueryData
 
     /// Starts a long-lived stream. See ``QueryFetcher/subscribe(container:fetchContext:state:writer:)``.
     static func subscribe(
         container: ModelContainer,
         fetchContext: Context,
-        state: State?,
-        writer: StateWriter<State>
+        previous: QueryData?,
+        writer: QueryDataWriter<QueryData>
     ) -> Task<Void, Never>?
 
     /// Deletes the collection's server-owned rows when its SWR cache expires or is removed.
@@ -52,8 +52,8 @@ extension QueryModel {
     public static func subscribe(
         container: ModelContainer,
         fetchContext: Context,
-        state: State?,
-        writer: StateWriter<State>
+        previous: QueryData?,
+        writer: QueryDataWriter<QueryData>
     ) -> Task<Void, Never>? {
         nil
     }
@@ -69,17 +69,17 @@ public struct ModelFetcher<Model: QueryModel>: QueryFetcher {
     public var cache: QueryCache? { Model.cache }
     public var tags: Set<String> { Model.tags }
 
-    public func fetch(context: ModelContext, fetchContext: Model.Context, state: Model.State?) async throws -> Model.State {
-        try await Model.fetch(context: context, fetchContext: fetchContext, state: state)
+    public func fetch(context: ModelContext, fetchContext: Model.Context, previous: Model.QueryData?) async throws -> Model.QueryData {
+        try await Model.fetch(context: context, fetchContext: fetchContext, previous: previous)
     }
 
     public func subscribe(
         container: ModelContainer,
         fetchContext: Model.Context,
-        state: Model.State?,
-        writer: StateWriter<Model.State>
+        previous: Model.QueryData?,
+        writer: QueryDataWriter<Model.QueryData>
     ) -> Task<Void, Never>? {
-        Model.subscribe(container: container, fetchContext: fetchContext, state: state, writer: writer)
+        Model.subscribe(container: container, fetchContext: fetchContext, previous: previous, writer: writer)
     }
 
     public func evict(context: ModelContext) throws {

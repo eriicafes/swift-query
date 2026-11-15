@@ -9,18 +9,25 @@ public typealias MutationRollback = @MainActor (ModelContext) throws -> Void
 /// ``QueryFetcher`` value.
 ///
 /// A ``QueryProvider`` creates one shared client per key, lazily. Views obtain it with
-/// ``QueryClient`` and read application data with SwiftData's `@Query`; data that lives only in
-/// the sync state is read from ``status``.
+/// ``QueryClient`` and read rows with SwiftData's `@Query`; a fetcher's own data is read from
+/// ``data``.
 @Observable
 @MainActor
 public final class ModelQueryClient<Fetcher: QueryFetcher> {
-    /// The synchronization state, carrying the persisted ``QueryFetcher/State``.
-    public private(set) var status: QueryStatus<Fetcher.State> = .pending
+    /// The query state: its status, data and staleness.
+    public private(set) var state: QueryState<Fetcher.QueryData> = .pending
     /// The current fetch activity.
     public private(set) var fetchStatus: QueryFetchStatus = .idle
+
+    /// The data from the last successful fetch, if any. Shorthand for `state.data`.
+    public var data: Fetcher.QueryData? { state.data }
+    /// Whether the first fetch is running: nothing fetched yet, and a fetch in flight.
+    public var isLoading: Bool { state.isPending && fetchStatus == .fetching }
+    /// Whether any fetch is running.
+    public var isFetching: Bool { fetchStatus == .fetching }
     /// The error of the last failed fetch, cleared by the next successful fetch.
     ///
-    /// When a refresh fails after a previous success, ``status`` stays a stale
+    /// When a refresh fails after a previous success, ``state`` stays a stale
     /// `success` and the failure is reported here.
     public private(set) var error: (any Error)?
 
@@ -113,7 +120,7 @@ public final class ModelQueryClient<Fetcher: QueryFetcher> {
     }
 
     /// Cancels the in-flight fetch, if any. Rows it already saved stay, its sync state is not
-    /// saved, and ``status`` keeps its previous value. Call it before an optimistic update so a
+    /// saved, and ``state`` keeps its previous value. Call it before an optimistic update so a
     /// slow fetch sent earlier can't overwrite the edit.
     public func cancel() {
         enqueue { await $0.cancelFetch() }
@@ -138,12 +145,12 @@ public final class ModelQueryClient<Fetcher: QueryFetcher> {
     /// - On success, optimistic changes are kept and the client awaits a fetch that starts after
     ///   the mutation, so a fetch already in flight (possibly sent before the mutation reached the
     ///   server) can't leave stale data behind. A failed refresh does not roll back or throw; it is
-    ///   reported through ``status`` and ``error``.
+    ///   reported through ``state`` and ``error``.
     /// - On failure, the returned rollback runs and the mutation error is rethrown. If a newer
     ///   optimistic mutation has started since, the rollback is skipped so it cannot clobber the
     ///   newer change, and the client refetches once no mutations are pending.
     ///
-    /// Mutation failures never change ``status`` to `.error`.
+    /// Mutation failures never change ``state`` to `.error`.
     ///
     /// A refetch writes the server's current data straight to SwiftData. If it runs while another
     /// mutation's remote call is still in flight, that mutation's optimistic edit can briefly show
@@ -344,16 +351,16 @@ public final class ModelQueryClient<Fetcher: QueryFetcher> {
         enqueue { await $0.detach() }
     }
 
-    func query(staleTime: StaleTime?) async throws -> Fetcher.State {
+    func query(staleTime: StaleTime?) async throws -> Fetcher.QueryData {
         await tail?.value
         let data = try await actor.query(staleTime: staleTime)
-        return try JSONDecoder().decode(Fetcher.State.self, from: data)
+        return try JSONDecoder().decode(Fetcher.QueryData.self, from: data)
     }
 
-    func setState(_ value: Fetcher.State) async throws {
+    func setQueryData(_ value: Fetcher.QueryData) async throws {
         let data = try JSONEncoder().encode(value)
         await tail?.value
-        await actor.setState(data)
+        await actor.setQueryData(data)
     }
 
     func remove() async {
@@ -407,21 +414,21 @@ public final class ModelQueryClient<Fetcher: QueryFetcher> {
         switch snapshot.status {
         case .pending:
             stateData = nil
-            if !status.isPending {
-                status = .pending
+            if !state.isPending {
+                state = .pending
             }
         case .success(let data, let stale):
-            guard data != stateData || stale != status.isStale || status.value == nil else { break }
-            if let value = try? JSONDecoder().decode(Fetcher.State.self, from: data) {
+            guard data != stateData || stale != state.isStale || state.data == nil else { break }
+            if let value = try? JSONDecoder().decode(Fetcher.QueryData.self, from: data) {
                 stateData = data
-                status = .success(value: value, stale: stale)
+                state = .success(data: value, stale: stale)
             } else {
                 stateData = nil
-                status = .pending
+                state = .pending
             }
         case .error(let error):
             stateData = nil
-            status = .error(error)
+            state = .error(error)
         }
         if fetchStatus != snapshot.fetchStatus {
             fetchStatus = snapshot.fetchStatus
@@ -449,7 +456,7 @@ public final class ModelQueryClient<Fetcher: QueryFetcher> {
               let (value, data, stale) = Self.storedState(fetcher, key: recordKey, in: modelContainer.mainContext)
         else { return }
         stateData = data
-        status = .success(value: value, stale: stale)
+        state = .success(data: value, stale: stale)
     }
 
     /// Decodes a key's stored state, if it has usable state.
@@ -457,11 +464,11 @@ public final class ModelQueryClient<Fetcher: QueryFetcher> {
         _ fetcher: Fetcher,
         key: String,
         in context: ModelContext
-    ) -> (Fetcher.State, Data, stale: Bool)? {
+    ) -> (Fetcher.QueryData, Data, stale: Bool)? {
         guard let record = try? context.fetch(QueryRecord.descriptor(key: key, limit: 1)).first,
               let data = record.stateData,
               let lastSyncedAt = record.lastSyncedAt,
-              let value = try? JSONDecoder().decode(Fetcher.State.self, from: data)
+              let value = try? JSONDecoder().decode(Fetcher.QueryData.self, from: data)
         else { return nil }
         let stale = record.invalidated
             || (fetcher.cache ?? .forever()).isStale(lastSyncedAt: lastSyncedAt, now: .now)

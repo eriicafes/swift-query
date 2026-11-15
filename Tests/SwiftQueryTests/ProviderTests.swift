@@ -45,19 +45,19 @@ struct ProviderTests {
         await client.settle()
 
         await provider.collectGarbage()
-        #expect(client.status.value == .init(etag: 1))
+        #expect(client.data == .init(etag: 1))
         #expect(await server.fetchCount == 1)
     }
 
     @Test("Garbage collection honors the cache policy of the most recent sync")
     func garbageCollectionUsesLastCache() async throws {
         let (provider, client, server) = try makeProvider()
-        client.sync(.swr(staleTime: .seconds(3600), cacheTime: .zero))
+        client.sync(.swr(staleTime: .seconds(3600), gcTime: .zero))
         await client.settle()
-        #expect(client.status.value == .init(etag: 1))
+        #expect(client.data == .init(etag: 1))
 
         await provider.collectGarbage()
-        #expect(client.status.isPending)
+        #expect(client.state.isPending)
         #expect(try localUsers(client).isEmpty)
         #expect(await server.fetchCount == 1)
     }

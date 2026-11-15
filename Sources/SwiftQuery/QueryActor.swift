@@ -22,7 +22,7 @@ struct QuerySnapshot: Sendable {
 /// has no cache keep their record in memory, unattached to any context, and never save it.
 actor QueryActor<Fetcher: QueryFetcher> {
     typealias Publisher = @Sendable (QuerySnapshot) async -> Void
-    typealias Write = @Sendable (inout Fetcher.State) -> Void
+    typealias Write = @Sendable (inout Fetcher.QueryData) -> Void
     /// Invalidates other keys that share an evicted key's tags.
     typealias EvictHandler = @Sendable (_ tags: Set<String>, _ key: String) async -> Void
 
@@ -59,7 +59,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
     private(set) var subscriptions = 0
     private var observers = 0
     /// The cache policy of the most recent sync, used by garbage collection so per-view
-    /// overrides such as `.swr(cacheTime:)` are honored.
+    /// overrides such as `.swr(gcTime:)` are honored.
     private var lastCache: QueryCache?
     /// Stream writes received while a fetch is in flight, applied after it finishes.
     private var pendingWrites: [Write] = []
@@ -70,7 +70,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
     /// that appear often (list rows) from saving on every appearance. Expiry can therefore come
     /// up to this much early, which is negligible next to cache times measured in minutes.
     static var accessResolution: TimeInterval { 60 }
-    private var stateWriter: StateWriter<Fetcher.State>?
+    private var stateWriter: QueryDataWriter<Fetcher.QueryData>?
 
     init(
         fetcher: Fetcher,
@@ -106,9 +106,9 @@ actor QueryActor<Fetcher: QueryFetcher> {
     }
 
     /// The writer handed to `subscribe`. It holds this actor weakly.
-    private var writer: StateWriter<Fetcher.State> {
+    private var writer: QueryDataWriter<Fetcher.QueryData> {
         if let stateWriter { return stateWriter }
-        let writer = StateWriter<Fetcher.State> { [weak self] body in
+        let writer = QueryDataWriter<Fetcher.QueryData> { [weak self] body in
             await self?.write(body)
         }
         stateWriter = writer
@@ -200,7 +200,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
     }
 
     /// Replaces the stored state, as if a fetch had just returned it.
-    func setState(_ data: Data) async {
+    func setQueryData(_ data: Data) async {
         loadIfNeeded()
         do {
             let record = try record()
@@ -370,7 +370,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
     private func performFetch(id: UInt64) async {
         let generation = invalidations
         let storedData = (try? record().stateData).flatMap { Self.isDecodable($0) ? $0 : nil }
-        fetchStatus = storedData == nil ? .loading : .fetching
+        fetchStatus = .fetching
         await publish()
 
         do {
@@ -502,7 +502,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
     }
 
     /// Returns the stored state and whether it is stale, or `nil` when there is no usable state.
-    /// State that no longer decodes, for example after `State` changed in an app update,
+    /// QueryData that no longer decodes, for example after `QueryData` changed in an app update,
     /// counts as missing so the next sync fetches from the default state.
     private func freshness(of record: QueryRecord, cache: QueryCache, now: Date) -> (Data, Bool)? {
         guard let data = record.stateData,
@@ -559,9 +559,9 @@ actor QueryActor<Fetcher: QueryFetcher> {
         if record.tags != tags {
             record.tags = tags
         }
-        let cacheTime = cache.cacheTime.map { $0 / .seconds(1) }
-        if record.cacheTime != cacheTime {
-            record.cacheTime = cacheTime
+        let gcTime = cache.gcTime.map { $0 / .seconds(1) }
+        if record.gcTime != gcTime {
+            record.gcTime = gcTime
         }
     }
 
@@ -576,7 +576,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
     /// Decodes `data`, applies `writes` in order, and re-encodes. `nil` if it doesn't decode.
     private static func applying(_ writes: [Write], to data: Data) -> Data? {
         guard !writes.isEmpty else { return data }
-        guard var state = try? JSONDecoder().decode(Fetcher.State.self, from: data) else {
+        guard var state = try? JSONDecoder().decode(Fetcher.QueryData.self, from: data) else {
             return nil
         }
         for write in writes {
@@ -586,11 +586,11 @@ actor QueryActor<Fetcher: QueryFetcher> {
     }
 
     private static func isDecodable(_ data: Data) -> Bool {
-        (try? JSONDecoder().decode(Fetcher.State.self, from: data)) != nil
+        (try? JSONDecoder().decode(Fetcher.QueryData.self, from: data)) != nil
     }
 
-    private static func decodedState(_ data: Data?) -> Fetcher.State? {
-        data.flatMap { try? JSONDecoder().decode(Fetcher.State.self, from: $0) }
+    private static func decodedState(_ data: Data?) -> Fetcher.QueryData? {
+        data.flatMap { try? JSONDecoder().decode(Fetcher.QueryData.self, from: $0) }
     }
 
     /// Runs the fetch outside actor isolation with a fresh context.
@@ -606,7 +606,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
         let state = try await fetcher.fetch(
             context: context,
             fetchContext: fetchContext,
-            state: decodedState(stateData)
+            previous: decodedState(stateData)
         )
         if context.hasChanges {
             try context.save()
@@ -619,12 +619,12 @@ actor QueryActor<Fetcher: QueryFetcher> {
         stateData: Data?,
         modelContainer: ModelContainer,
         fetchContext: Fetcher.Context,
-        writer: StateWriter<Fetcher.State>
+        writer: QueryDataWriter<Fetcher.QueryData>
     ) -> Task<Void, Never>? {
         fetcher.subscribe(
             container: modelContainer,
             fetchContext: fetchContext,
-            state: decodedState(stateData),
+            previous: decodedState(stateData),
             writer: writer
         )
     }

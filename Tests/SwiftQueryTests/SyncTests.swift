@@ -9,13 +9,16 @@ struct SyncTests {
     @Test("Initial sync fetches and publishes success")
     func initialSync() async throws {
         let (_, client, server) = try makeProvider()
-        #expect(client.status.isPending)
+        #expect(client.state.isPending)
 
         client.sync()
         await client.settle()
 
-        #expect(client.status.value == .init(etag: 1))
-        #expect(client.status.isStale == false)
+        #expect(client.data == .init(etag: 1))
+        #expect(client.state.isStale == false)
+        #expect(client.state.isSuccess)
+        #expect(client.data == client.state.data)
+        #expect(client.isLoading == false)
         #expect(client.fetchStatus == .idle)
         #expect(client.error == nil)
         #expect(await server.fetchCount == 1)
@@ -50,7 +53,7 @@ struct SyncTests {
 
         client.sync()
         await server.checkpoints.reached("fetch")
-        #expect(client.fetchStatus == .loading)
+        #expect(client.isLoading)
         await server.checkpoints.release("fetch")
         await client.settle()
 
@@ -75,7 +78,7 @@ struct SyncTests {
 
         await client.refresh()
         #expect(await server.fetchCount == 2)
-        #expect(client.status.value == .init(etag: 2))
+        #expect(client.data == .init(etag: 2))
     }
 
     @Test("refreshAfter makes data stale")
@@ -101,13 +104,13 @@ struct SyncTests {
 
         client.invalidate()
         await client.settle()
-        #expect(client.status.isStale)
+        #expect(client.state.isStale)
         #expect(await server.fetchCount == 1)
 
         client.sync()
         await client.settle()
         #expect(await server.fetchCount == 2)
-        #expect(client.status.isStale == false)
+        #expect(client.state.isStale == false)
     }
 
     @Test("Invalidation during a fetch survives that fetch")
@@ -121,12 +124,12 @@ struct SyncTests {
         await client.settleOperations()
         await server.checkpoints.release("fetch")
         await client.settle()
-        #expect(client.status.isStale)
+        #expect(client.state.isStale)
 
         client.sync()
         await client.settle()
         #expect(await server.fetchCount == 2)
-        #expect(client.status.isStale == false)
+        #expect(client.state.isStale == false)
     }
 
     @Test("Initial failure is an error; later failures keep stale success")
@@ -136,18 +139,18 @@ struct SyncTests {
         await server.failNextFetch()
         client.sync()
         await client.settle()
-        #expect(client.status.isError)
+        #expect(client.state.isError)
         #expect(client.error is ServerError)
 
         client.sync()
         await client.settle()
-        #expect(client.status.value == .init(etag: 1))
+        #expect(client.data == .init(etag: 1))
         #expect(client.error == nil)
 
         await server.failNextFetch()
         await client.refresh()
-        #expect(client.status.value == .init(etag: 1))
-        #expect(client.status.isStale)
+        #expect(client.data == .init(etag: 1))
+        #expect(client.state.isStale)
         #expect(client.error is ServerError)
         #expect(try localUsers(client) == ["1": "Ada", "2": "Grace"])
     }
@@ -163,7 +166,7 @@ struct SyncTests {
         }
 
         let (_, client, _) = try makeProvider(container, server: server)
-        #expect(client.status.value == .init(etag: 1))
+        #expect(client.data == .init(etag: 1))
 
         client.sync()
         await client.settle()
@@ -215,11 +218,11 @@ struct SyncTests {
         client.sync()
         await client.settle()
 
-        client.sync(.swr(staleTime: .seconds(3600), cacheTime: .zero))
+        client.sync(.swr(staleTime: .seconds(3600), gcTime: .zero))
         await client.settle()
 
         #expect(await server.requestedEtags == [nil, nil])
-        #expect(client.status.value == .init(etag: 2))
+        #expect(client.data == .init(etag: 2))
     }
 
     @Test("Observed caches are not evicted")
@@ -231,7 +234,7 @@ struct SyncTests {
         await client.settle()
         #expect(await server.fetchCount == 1)
 
-        client.sync(.swr(staleTime: .seconds(3600), cacheTime: .zero))
+        client.sync(.swr(staleTime: .seconds(3600), gcTime: .zero))
         await client.settle()
         #expect(await server.fetchCount == 1)
     }
@@ -245,12 +248,12 @@ struct SyncTests {
         try container.mainContext.save()
 
         let (_, client, server) = try makeProvider(container)
-        #expect(client.status.isPending)
+        #expect(client.state.isPending)
 
         client.sync()
         await client.settle()
         #expect(await server.requestedEtags == [nil])
-        #expect(client.status.value == .init(etag: 1))
+        #expect(client.data == .init(etag: 1))
     }
 
     @Test("Changes left unsaved by fetch are saved")
@@ -270,7 +273,7 @@ struct SyncTests {
 
         let inFlight = Task { await client.refresh() }
         await server.checkpoints.reached("fetch", count: 2)
-        client.sync(.swr(staleTime: .seconds(3600), cacheTime: .zero))
+        client.sync(.swr(staleTime: .seconds(3600), gcTime: .zero))
         await client.settleOperations()
         await server.checkpoints.release("fetch")
         await inFlight.value
@@ -301,7 +304,7 @@ struct SyncTests {
     @Test("Duplicate query records collapse to the most recently synced")
     func duplicateRecords() async throws {
         let container = try makeContainer()
-        let state = try JSONEncoder().encode(TestUser.State(etag: 5))
+        let state = try JSONEncoder().encode(TestUser.QueryData(etag: 5))
         container.mainContext.insert(QueryRecord(key: TestUser.queryKey))
         container.mainContext.insert(QueryRecord(key: TestUser.queryKey, stateData: state, lastSyncedAt: .now))
         try container.mainContext.save()
@@ -310,7 +313,7 @@ struct SyncTests {
         client.sync()
         await client.settle()
 
-        #expect(client.status.value == .init(etag: 5))
+        #expect(client.data == .init(etag: 5))
         #expect(await server.fetchCount == 0)
         let records = try container.mainContext.fetch(FetchDescriptor<QueryRecord>())
         #expect(records.count == 1)
@@ -323,7 +326,7 @@ struct SyncTests {
         await client.settle()
 
         let state = Flag(), error = Flag(), fetchStatus = Flag()
-        withObservationTracking { _ = client.status } onChange: { state.value = true }
+        withObservationTracking { _ = client.state } onChange: { state.value = true }
         withObservationTracking { _ = client.error } onChange: { error.value = true }
         withObservationTracking { _ = client.fetchStatus } onChange: { fetchStatus.value = true }
         client.sync()
@@ -361,7 +364,7 @@ struct SyncTests {
         let client = provider.client(for: TestNote.self)
         await client.refresh()
 
-        client.sync(.swr(staleTime: .seconds(3600), cacheTime: .zero))
+        client.sync(.swr(staleTime: .seconds(3600), gcTime: .zero))
         await client.settle()
         #expect(client.error is EvictionError)
         let notes = try client.modelContainer.mainContext.fetch(FetchDescriptor<TestNote>())
@@ -370,6 +373,6 @@ struct SyncTests {
         client.sync()
         await client.settle()
         #expect(await server.requestedEtags == [nil, nil])
-        #expect(client.status.value == .init(etag: 2))
+        #expect(client.data == .init(etag: 2))
     }
 }

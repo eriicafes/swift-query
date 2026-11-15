@@ -2,4 +2,4 @@
 "swift-query": minor
 ---
 
-Added `@QueryClient` and `ModelQueryClient`
+Added `@QueryClient` and `ModelQueryClient` with `QueryState`

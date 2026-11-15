@@ -77,8 +77,8 @@ struct FetcherTests {
         await usd.refresh()
         await gbp.refresh()
 
-        #expect(usd.status.value == 1)
-        #expect(gbp.status.value == 2)
+        #expect(usd.data == 1)
+        #expect(gbp.data == 2)
         #expect(await rates.requests == ["USD-EUR", "GBP-EUR"])
     }
 
@@ -88,7 +88,7 @@ struct FetcherTests {
         do {
             let client = provider.client(for: TestRate(from: "USD", to: "EUR"))
             let subscription = await observe(client)
-            #expect(client.status.value == 1)
+            #expect(client.data == 1)
 
             client.sync()
             await client.settle()
@@ -159,7 +159,7 @@ struct FetcherTests {
         provider.invalidate(tag: "user-1")
         await one.settle()
         #expect(await server.fetchCount == fetches + 1)
-        #expect(one.status.isStale == false)
+        #expect(one.state.isStale == false)
 
         provider.invalidate(tag: "users")
         #expect(try record(provider, stored)?.invalidated == true)
@@ -177,9 +177,9 @@ struct FetcherTests {
         provider.invalidate(TestDetail.self)
         await one.settle()
         await two.settle()
-        #expect(one.status.isStale)
-        #expect(two.status.isStale)
-        #expect(provider.client(for: TestUser.self).status.isStale == false)
+        #expect(one.state.isStale)
+        #expect(two.state.isStale)
+        #expect(provider.client(for: TestUser.self).state.isStale == false)
     }
 
     // MARK: Eviction and garbage collection
@@ -196,7 +196,7 @@ struct FetcherTests {
 
         let expiredKey = QueryRecord.Key.make(TestDetail(id: "1"))
         let context = ModelContext(provider.modelContainer)
-        try #require(try context.fetch(QueryRecord.descriptor(key: expiredKey)).first).cacheTime = 0
+        try #require(try context.fetch(QueryRecord.descriptor(key: expiredKey)).first).gcTime = 0
         try context.save()
 
         await provider.collectGarbage()
@@ -210,8 +210,8 @@ struct FetcherTests {
         let (provider, _, _) = try makeProvider()
         let context = ModelContext(provider.modelContainer)
         let old = Date.now.addingTimeInterval(-10)
-        context.insert(QueryRecord(key: "Gone.Fetcher:{}", stateData: Data(), lastSyncedAt: old, cacheTime: 0))
-        context.insert(QueryRecord(key: String(reflecting: TestDetail.self) + ":{\"renamed\":1}", stateData: Data(), lastSyncedAt: old, cacheTime: 0))
+        context.insert(QueryRecord(key: "Gone.Fetcher:{}", stateData: Data(), lastSyncedAt: old, gcTime: 0))
+        context.insert(QueryRecord(key: String(reflecting: TestDetail.self) + ":{\"renamed\":1}", stateData: Data(), lastSyncedAt: old, gcTime: 0))
         context.insert(QueryRecord(key: "Gone.Forever:{}", stateData: Data(), lastSyncedAt: old))
         try context.save()
 
@@ -232,8 +232,8 @@ struct FetcherTests {
             try await provider.query(TestStoredRate(from: "USD"))
         }
         let (provider, rates) = try makeRates(container)
-        #expect(provider.status(for: TestStoredRate(from: "USD")).value == 1)
-        #expect(provider.status(for: TestStoredRate(from: "GBP")).isPending)
+        #expect(provider.getQueryData(for: TestStoredRate(from: "USD")) == 1)
+        #expect(provider.getQueryState(for: TestStoredRate(from: "GBP")).isPending)
         #expect(provider.liveClients.isEmpty)
         #expect(await rates.requests.isEmpty)
     }
@@ -265,15 +265,15 @@ struct FetcherTests {
     func prefetch() async throws {
         let (provider, rates) = try makeRates()
         provider.prefetch(TestStoredRate(from: "USD"))
-        await eventually { provider.status(for: TestStoredRate(from: "USD")).value == 1 }
+        await eventually { provider.getQueryData(for: TestStoredRate(from: "USD")) == 1 }
         #expect(await rates.requests.count == 1)
     }
 
-    @Test("setState stores fresh state without fetching")
-    func setState() async throws {
+    @Test("setQueryData stores fresh data without fetching")
+    func setQueryData() async throws {
         let (provider, rates) = try makeRates()
-        try await provider.setState(for: TestStoredRate(from: "USD"), 9.5)
-        #expect(provider.status(for: TestStoredRate(from: "USD")).value == 9.5)
+        try await provider.setQueryData(for: TestStoredRate(from: "USD"), 9.5)
+        #expect(provider.getQueryData(for: TestStoredRate(from: "USD")) == 9.5)
         #expect(try await provider.query(TestStoredRate(from: "USD")) == 9.5)
         #expect(await rates.requests.isEmpty)
     }
@@ -292,7 +292,7 @@ struct FetcherTests {
         await rates.checkpoints.release("rate")
 
         await #expect(throws: CancellationError.self) { try await query.value }
-        #expect(provider.status(for: key).value == 1)
+        #expect(provider.getQueryData(for: key) == 1)
     }
 
     @Test("remove evicts rows and state; keys sharing a tag are invalidated")
@@ -305,10 +305,10 @@ struct FetcherTests {
 
         await provider.remove(TestDetail(id: "1"))
         await two.settle()
-        #expect(one.status.isPending)
+        #expect(one.state.isPending)
         #expect(try profiles(provider) == ["2": "Grace"])
         #expect(try record(provider, QueryRecord.Key.make(TestDetail(id: "1"))) == nil)
-        #expect(two.status.isStale)
+        #expect(two.state.isStale)
     }
 
     @Test("reset refetches keys a view still shows")
@@ -322,7 +322,7 @@ struct FetcherTests {
         await one.settle()
         #expect(await server.fetchCount == fetches + 1)
         #expect(try profiles(provider) == ["1": "Ada"])
-        #expect(one.status.value != nil)
+        #expect(one.data != nil)
         _ = subscription
     }
 
@@ -346,13 +346,13 @@ struct FetcherTests {
     func resyncKeepsOverride() async throws {
         let (provider, client, _) = try makeProvider()
         let subscription = Subscription<ModelFetcher<TestUser>>()
-        subscription.activate(client, cache: .swr(staleTime: .seconds(3600), cacheTime: .seconds(7)))
+        subscription.activate(client, cache: .swr(staleTime: .seconds(3600), gcTime: .seconds(7)))
         await client.settle()
 
         provider.invalidate(TestUser.self)
         await client.settleOperations()
         await client.settle()
-        #expect(try record(provider, TestUser.queryKey)?.cacheTime == 7)
+        #expect(try record(provider, TestUser.queryKey)?.gcTime == 7)
         _ = subscription
     }
 }
