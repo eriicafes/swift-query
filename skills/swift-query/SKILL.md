@@ -10,13 +10,13 @@ description: Use when syncing SwiftData or other remote data with external APIs 
 Use this skill when the user wants to:
 
 - fetch remote data into SwiftData models and keep it fresh
-- fetch a single row, extra data attached to rows, or data that never touches SwiftData
+- fetch a single row, extra data attached to rows, or a standalone value with no model of its own
 - set up a `QueryProvider` and use `@QueryClient` in views
 - add pull-to-refresh, invalidation, streams, or optimistic mutations
 
 ## Core Guidance
 
-SwiftData is the source of truth for rows. Views read rows with SwiftData's `@Query` and use `@QueryClient` for sync state and actions. Data that never touches SwiftData (an exchange rate, a count) lives in the key's `State` and is read from `client.status.value`.
+SwiftData is the source of truth for rows. Views read rows with SwiftData's `@Query` and use `@QueryClient` for sync state and actions. A value with no model of its own (an exchange rate, a count) is the key's `State`: return it from `fetch` and read it from `client.status.value`. SwiftQuery stores it in its `QueryRecord` table, or only in memory when `cache` is `nil`.
 
 Pick the conformance:
 

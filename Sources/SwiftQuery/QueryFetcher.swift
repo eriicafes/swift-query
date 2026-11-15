@@ -9,7 +9,8 @@ public protocol Queryable {}
 ///
 /// The fetcher value is the key: each distinct value gets its own client, state and cache entry.
 /// Use it for anything that isn't a whole SwiftData collection: a single row, extra data attached
-/// to rows, or data that never touches SwiftData and lives entirely in ``State``.
+/// to rows, or a value with no model of its own, returned as ``State``. SwiftQuery stores that
+/// state in its own ``QueryRecord`` table, or only in memory when ``cache`` is `nil`.
 ///
 /// ```swift
 /// struct ExchangeRate: QueryFetcher {
