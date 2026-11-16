@@ -40,9 +40,16 @@ public final class QueryProvider {
     var mutationCount = 0
     /// How many mutations are running or queued per scope.
     var scopeMutationCounts: [AnyHashable: Int] = [:]
-    /// The filters of optimistic mutations whose remote call hasn't returned, by mutation. Keys
-    /// they match are held: syncs don't fetch them, and settling defers their refetch.
-    @ObservationIgnored var optimisticFilters: [ObjectIdentifier: [QueryFilter]] = [:]
+    /// The filters of optimistic mutations whose remote call hasn't returned, by mutation id.
+    /// Keys they match are held: syncs don't fetch them, and settling defers their refetch.
+    @ObservationIgnored var optimisticFilters: [UInt64: [QueryFilter]] = [:]
+    /// The id of the most recently begun mutation.
+    @ObservationIgnored var nextMutationID: UInt64 = 0
+    /// Optimistic mutations newer than the oldest one still undecided, so a failing mutation can
+    /// skip a rollback that would clobber a newer edit.
+    @ObservationIgnored var optimisticHistory: [OptimisticEntry] = []
+    /// Optimistic mutations whose remote call hasn't succeeded or failed yet.
+    @ObservationIgnored var undecidedOptimistic: Set<UInt64> = []
     @ObservationIgnored private var contexts: [ObjectIdentifier: Any] = [:]
     @ObservationIgnored private(set) var entries: [String: FetcherEntry] = [:]
     /// Every live client, held weakly so a client someone still holds is reused, never duplicated.
@@ -289,7 +296,6 @@ public final class QueryProvider {
     ///     try await api.follow(id)
     /// } optimistic: { tx in
     ///     tx.setQueryData(for: UserStats(id: id)) { $0.followers += 1 }
-    ///     return nil
     /// }
     /// ```
     ///
@@ -301,12 +307,14 @@ public final class QueryProvider {
     /// - The remote call runs in its own task, so cancelling the caller doesn't cancel a call that
     ///   was already sent; the caller still gets its result. A caller cancelled before its call is
     ///   sent rolls back and throws `CancellationError`.
-    /// - On failure, the rollback runs and query data changed with
-    ///   ``OptimisticContext/setQueryData(for:_:)-(F,_)`` is restored, then the error is
-    ///   rethrown. Query data is only restored if nothing has changed it since. The rollback is
-    ///   skipped if a newer optimistic mutation has started since in the same scope, or, without
-    ///   a scope, from the same ``QueryObserver``, so it can't clobber the newer change; the
-    ///   mutation's keys that have a client then refetch even where no view shows them.
+    /// - On failure, the rollbacks registered with ``OptimisticContext/onRollback(_:)`` run and
+    ///   query data changed with ``OptimisticContext/setQueryData(for:_:)-(F,_)`` is restored,
+    ///   then the error is rethrown. Query data is only restored if nothing has changed it since.
+    ///   The rollbacks are skipped if a newer optimistic mutation may have edited the same data,
+    ///   so they can't clobber its change: one in the same scope, or one whose filters overlap
+    ///   this mutation's (a tag or `.all` overlaps every filter; keys and types overlap when they
+    ///   match a common key; a mutation without filters overlaps only its scope). The mutation's
+    ///   keys that have a client then refetch even where no view shows them.
     /// - Whether it succeeds or fails, the mutation settles by invalidating the keys matching
     ///   `invalidates`, plus any key whose query data the optimistic update changed. Keys shown
     ///   in a view refetch with a request sent after the mutation, and `mutate` waits for them; a
@@ -345,9 +353,9 @@ public final class QueryProvider {
         scope: (any Hashable & Sendable)? = nil,
         invalidates: [QueryFilter] = [],
         _ mutation: @escaping @Sendable () async throws -> sending Result,
-        optimistic: (@MainActor (OptimisticContext) throws -> MutationRollback?)? = nil
+        optimistic: OptimisticUpdate? = nil
     ) async throws -> Result {
-        let run = try beginMutation(scope: scope, group: nil, invalidates: invalidates, optimistic: optimistic)
+        let run = try beginMutation(scope: scope, invalidates: invalidates, optimistic: optimistic)
         return try await finishMutation(run, mutation)
     }
 
@@ -718,6 +726,21 @@ public struct QueryFilter: Hashable, Sendable, Codable {
     /// Every key.
     public static var all: QueryFilter {
         QueryFilter(selector: .all)
+    }
+
+    /// Whether the two filters may match a common key. Keys and types are compared; a tag or
+    /// `.all` may match anything, since a filter alone doesn't say which keys a tag covers.
+    func overlaps(_ other: QueryFilter) -> Bool {
+        switch (selector, other.selector) {
+        case (.key(let a), .key(let b)), (.type(let a), .type(let b)):
+            a == b
+        case (.key(let key), .type):
+            other.matches(key: key, tags: [])
+        case (.type, .key(let key)):
+            matches(key: key, tags: [])
+        default:
+            true
+        }
     }
 
     func matches(key: String, tags: Set<String>) -> Bool {

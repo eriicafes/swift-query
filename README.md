@@ -493,18 +493,18 @@ When the mutation finishes, whether it succeeded or failed, that data is invalid
 
 ### Optimistic updates
 
-To update the screen before the server responds, pass an `optimistic` closure. Change rows in `tx.modelContext` and return a closure that undoes the change if the request fails:
+To update the screen before the server responds, pass an `optimistic` closure. Change rows in `tx.modelContext` and register a closure with `tx.onRollback` that undoes the change if the request fails:
 
 ```swift
 try await postsClient.mutate {
     try await api.rename(postID: id, to: title)
 } optimistic: { tx in
     guard let post = try tx.modelContext.fetch(FetchDescriptor<Post>(predicate: #Predicate { $0.id == id })).first else {
-        return nil
+        return
     }
     let previous = post.title
     post.title = title
-    return { _ in post.title = previous }   // undo
+    tx.onRollback { _ in post.title = previous }   // undo
 }
 ```
 
@@ -515,12 +515,11 @@ try await profileClient.mutate {
     try await api.follow(userID: id)
 } optimistic: { tx in
     tx.setQueryData(for: FollowerCount(userID: id)) { $0 += 1 }
-    return nil
 }
 ```
 
 - If the request succeeds, the changes stay until the data is fetched again.
-- If it fails, the undo closure runs, query data is put back, and the error is thrown to you. Query data is only put back if nothing, such as a fetch, has changed it since. If a newer optimistic mutation in the same scope, or from the same client, has started since, the undo closure is skipped so it can't undo the newer change, and the data is fetched again instead.
+- If it fails, the undo closures run (newest first), query data is put back, and the error is thrown to you. Query data is only put back if nothing, such as a fetch, has changed it since. If a newer optimistic mutation may have changed the same data since, the undo closures are skipped so they can't undo the newer change, and the data is fetched again instead. A newer mutation counts when it's in the same scope or invalidates overlapping data: the same key or type, or any tag or `.all`. A mutation that invalidates nothing only counts through its scope.
 - `setQueryData` stops a fetch of that data in progress, so an older response can't overwrite the change, and the data is invalidated when the mutation finishes. A `provider.query` waiting on that fetch gets the updated value.
 - While the request is in flight, the data it invalidates isn't fetched by views or by other mutations finishing, so the server's older data can't overwrite the change. Pull-to-refresh and `provider.query` still fetch.
 - Once a request is sent, cancelling the task that called `mutate` doesn't cancel it.
@@ -572,7 +571,6 @@ send.mutate(text) { text in
     try await api.send(text)
 } optimistic: { tx, text in
     tx.modelContext.insert(Message(text: text, pending: true))
-    return nil
 }
 ```
 

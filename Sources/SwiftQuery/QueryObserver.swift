@@ -39,8 +39,6 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
     @ObservationIgnored private var lastSequence: UInt64 = 0
     @ObservationIgnored private var stateData: Data?
     @ObservationIgnored let provider: QueryProvider
-    /// Bookkeeping for this client's unscoped mutations, which run in parallel.
-    @ObservationIgnored private let unscoped = MutationGroup()
     @ObservationIgnored private var observerCount = 0
     private var mutationCount = 0
     @ObservationIgnored private var wasActive = false
@@ -145,19 +143,19 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
     /// } optimistic: { tx in
     ///     let post = try tx.modelContext.fetch(descriptor).first
     ///     post.map(tx.modelContext.delete)
-    ///     return nil
     /// }
     /// ```
     ///
-    /// An unscoped mutation that fails skips its rollback when a newer optimistic mutation has
-    /// started from this client since, so it can't clobber the newer change. This client's data
-    /// then refetches even if no view shows it.
+    /// Since the client's key is in `invalidates`, a mutation that fails skips its rollback when
+    /// a newer optimistic mutation from this client, or any other covering its key, has started
+    /// since, so it can't clobber the newer change. This client's data then refetches even if no
+    /// view shows it.
     @discardableResult
     public func mutate<Result>(
         scope: (any Hashable & Sendable)? = nil,
         invalidates: [QueryFilter] = [],
         _ mutation: @escaping @Sendable () async throws -> sending Result,
-        optimistic: (@MainActor (OptimisticContext) throws -> MutationRollback?)? = nil
+        optimistic: OptimisticUpdate? = nil
     ) async throws -> Result {
         mutationCount += 1
         activityChanged()
@@ -167,7 +165,6 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
         }
         let run = try provider.beginMutation(
             scope: scope,
-            group: unscoped,
             invalidates: invalidates + [.key(self)],
             optimistic: optimistic
         )

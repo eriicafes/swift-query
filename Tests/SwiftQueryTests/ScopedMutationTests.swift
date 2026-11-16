@@ -6,15 +6,15 @@ import Testing
 @MainActor
 @Suite("Scoped mutations")
 struct ScopedMutationTests {
-    func rename(id: String, to name: String) -> @MainActor (OptimisticContext) throws -> MutationRollback? {
+    func rename(id: String, to name: String) -> OptimisticUpdate {
         { tx in
             let context = tx.modelContext
             let descriptor = FetchDescriptor<TestUser>(predicate: #Predicate { $0.id == id })
-            guard let user = try context.fetch(descriptor).first else { return nil }
+            guard let user = try context.fetch(descriptor).first else { return }
             let previous = user.name
             user.name = name
             try context.save()
-            return { context in
+            tx.onRollback { context in
                 guard let user = try context.fetch(descriptor).first else { return }
                 user.name = previous
                 try context.save()

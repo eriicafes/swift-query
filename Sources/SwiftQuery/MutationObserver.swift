@@ -98,7 +98,7 @@ public final class MutationObserver<Input: Sendable, Result> {
         scope: (any Hashable & Sendable)? = nil,
         invalidates: [QueryFilter] = [],
         _ mutation: @escaping @Sendable (Input) async throws -> sending Result,
-        optimistic: (@MainActor (OptimisticContext, Input) throws -> MutationRollback?)? = nil
+        optimistic: (@MainActor (OptimisticContext, Input) throws -> Void)? = nil
     ) {
         fire(
             input, scope: scope, invalidates: invalidates,
@@ -114,7 +114,7 @@ public final class MutationObserver<Input: Sendable, Result> {
         scope: (any Hashable & Sendable)? = nil,
         invalidates: [QueryFilter] = [],
         _ mutation: @escaping @Sendable (Input) async throws -> sending Result,
-        optimistic: (@MainActor (OptimisticContext, Input) throws -> MutationRollback?)? = nil
+        optimistic: (@MainActor (OptimisticContext, Input) throws -> Void)? = nil
     ) async throws -> Result {
         try await run(
             input, scope: scope, invalidates: invalidates,
@@ -133,9 +133,9 @@ public final class MutationObserver<Input: Sendable, Result> {
     }
 
     private static func bind(
-        _ optimistic: (@MainActor (OptimisticContext, Input) throws -> MutationRollback?)?,
+        _ optimistic: (@MainActor (OptimisticContext, Input) throws -> Void)?,
         _ input: Input
-    ) -> (@MainActor (OptimisticContext) throws -> MutationRollback?)? {
+    ) -> OptimisticUpdate? {
         guard let optimistic else { return nil }
         return { tx in try optimistic(tx, input) }
     }
@@ -146,7 +146,7 @@ public final class MutationObserver<Input: Sendable, Result> {
         scope: (any Hashable & Sendable)?,
         invalidates: [QueryFilter],
         _ mutation: @escaping @Sendable () async throws -> sending Result,
-        optimistic: (@MainActor (OptimisticContext) throws -> MutationRollback?)?
+        optimistic: OptimisticUpdate?
     ) {
         let call = start(input)
         let provider = installedProvider
@@ -173,7 +173,7 @@ public final class MutationObserver<Input: Sendable, Result> {
         scope: (any Hashable & Sendable)?,
         invalidates: [QueryFilter],
         _ mutation: @escaping @Sendable () async throws -> sending Result,
-        optimistic: (@MainActor (OptimisticContext) throws -> MutationRollback?)?
+        optimistic: OptimisticUpdate?
     ) async throws -> Result {
         let call = start(input)
         let provider = installedProvider
@@ -223,12 +223,10 @@ public final class MutationObserver<Input: Sendable, Result> {
         _ provider: QueryProvider,
         scope: (any Hashable & Sendable)?,
         invalidates: [QueryFilter],
-        optimistic: (@MainActor (OptimisticContext) throws -> MutationRollback?)?
+        optimistic: OptimisticUpdate?
     ) throws -> MutationRun {
         try provider.beginMutation(
             scope: scope ?? defaultScope,
-            // Unscoped calls are independent: one observer often edits many records.
-            group: nil,
             invalidates: defaultInvalidates + invalidates,
             optimistic: optimistic
         )
@@ -250,7 +248,7 @@ extension MutationObserver where Input == Void {
         scope: (any Hashable & Sendable)? = nil,
         invalidates: [QueryFilter] = [],
         _ mutation: @escaping @Sendable () async throws -> sending Result,
-        optimistic: (@MainActor (OptimisticContext) throws -> MutationRollback?)? = nil
+        optimistic: OptimisticUpdate? = nil
     ) {
         fire((), scope: scope, invalidates: invalidates, mutation, optimistic: optimistic)
     }
@@ -261,7 +259,7 @@ extension MutationObserver where Input == Void {
         scope: (any Hashable & Sendable)? = nil,
         invalidates: [QueryFilter] = [],
         _ mutation: @escaping @Sendable () async throws -> sending Result,
-        optimistic: (@MainActor (OptimisticContext) throws -> MutationRollback?)? = nil
+        optimistic: OptimisticUpdate? = nil
     ) async throws -> Result {
         try await run((), scope: scope, invalidates: invalidates, mutation, optimistic: optimistic)
     }

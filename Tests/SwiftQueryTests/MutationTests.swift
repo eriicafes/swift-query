@@ -6,15 +6,15 @@ import Testing
 @MainActor
 @Suite("Mutations")
 struct MutationTests {
-    func rename(_ client: UsersClient, id: String, to name: String) -> @MainActor (OptimisticContext) throws -> MutationRollback? {
+    func rename(_ client: UsersClient, id: String, to name: String) -> OptimisticUpdate {
         { tx in
             let context = tx.modelContext
             let descriptor = FetchDescriptor<TestUser>(predicate: #Predicate { $0.id == id })
-            guard let user = try context.fetch(descriptor).first else { return nil }
+            guard let user = try context.fetch(descriptor).first else { return }
             let previous = user.name
             user.name = name
             try context.save()
-            return { context in
+            tx.onRollback { context in
                 guard let user = try context.fetch(descriptor).first else { return }
                 user.name = previous
                 try context.save()
@@ -135,10 +135,10 @@ struct MutationTests {
             try ModelContext(client.modelContainer)
                 .fetch(FetchDescriptor<TestUser>(predicate: #Predicate { $0.id == "1" })).first?.name
         }
-        let unsavedRename: @MainActor (OptimisticContext) throws -> MutationRollback? = { tx in
+        let unsavedRename: OptimisticUpdate = { tx in
             let user = try #require(try tx.modelContext.fetch(FetchDescriptor<TestUser>(predicate: #Predicate { $0.id == "1" })).first)
             user.name = "Unsaved"
-            return { context in
+            tx.onRollback { context in
                 let user = try #require(try context.fetch(FetchDescriptor<TestUser>(predicate: #Predicate { $0.id == "1" })).first)
                 user.name = "Ada"
             }
@@ -238,7 +238,6 @@ struct MutationTests {
             }, optimistic: { tx in
                 let user = try #require(try tx.modelContext.fetch(FetchDescriptor<TestUser>(predicate: #Predicate { $0.id == "1" })).first)
                 user.name = "Ada L."
-                return nil
             })
         }
         await server.checkpoints.reached("rename:Ada L.")

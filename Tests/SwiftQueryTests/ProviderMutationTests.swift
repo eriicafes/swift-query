@@ -38,6 +38,21 @@ struct ProviderMutationTests {
         #expect(QueryFilter.all.matches(key: detail, tags: tags))
     }
 
+    @Test("Filters overlap when they may match a common key")
+    func filterOverlap() {
+        let one = QueryFilter.key(TestDetail(id: "1"))
+        #expect(one.overlaps(.key(TestDetail(id: "1"))))
+        #expect(!one.overlaps(.key(TestDetail(id: "2"))))
+        #expect(one.overlaps(.type(TestDetail.self)))
+        #expect(QueryFilter.type(TestDetail.self).overlaps(one))
+        #expect(!one.overlaps(.type(TestUser.self)))
+        #expect(!QueryFilter.type(TestDetail.self).overlaps(.type(TestUser.self)))
+        // A filter alone doesn't say which keys a tag covers.
+        #expect(one.overlaps(.tag("anything")))
+        #expect(QueryFilter.tag("a").overlaps(.tag("b")))
+        #expect(QueryFilter.all.overlaps(one))
+    }
+
     @Test("Bulk operations take several filters")
     func variadicInvalidate() async throws {
         let (provider, users, _) = try await loaded(observed: false)
@@ -174,7 +189,6 @@ struct ProviderMutationTests {
                 try await server.rename(id: "1", to: "Ada L.")
             } optimistic: { tx in
                 tx.setQueryData(for: TestUser.self) { $0.etag = 99 }
-                return nil
             }
         }
         await server.checkpoints.reached("rename:Ada L.")
@@ -203,7 +217,6 @@ struct ProviderMutationTests {
             } optimistic: { tx in
                 tx.setQueryData(for: TestUser.self) { $0.etag = 99 }
                 #expect(users.data?.etag == 99)
-                return nil
             }
         }
         await users.settleOperations()
@@ -221,7 +234,6 @@ struct ProviderMutationTests {
                 try await server.rename(id: "1", to: "Nope", fail: true)
             } optimistic: { tx in
                 tx.setQueryData(for: TestUser.self) { $0.etag = 99 }
-                return nil
             }
         }
         await server.checkpoints.reached("rename:Nope")
@@ -240,7 +252,6 @@ struct ProviderMutationTests {
             try await server.rename(id: "1", to: "Ada L.")
         } optimistic: { tx in
             tx.setQueryData(for: TestDetail(id: "1")) { $0.version = 99 }
-            return nil
         }
         #expect(provider.getQueryData(for: TestDetail(id: "1")) == nil)
     }
@@ -352,7 +363,6 @@ struct ProviderMutationTests {
         } optimistic: { tx, name in
             let user = try tx.modelContext.fetch(FetchDescriptor<TestUser>(predicate: #Predicate { $0.id == "1" })).first
             user?.name = name
-            return nil
         } }()
         #expect(try localUsers(users)["1"] == "Ada L.")
         await server.checkpoints.release("rename:Ada L.")
@@ -361,13 +371,13 @@ struct ProviderMutationTests {
 
     // MARK: Skipped rollbacks
 
-    func renameRow(_ id: String, to name: String) -> @MainActor (OptimisticContext) throws -> MutationRollback? {
+    func renameRow(_ id: String, to name: String) -> OptimisticUpdate {
         { tx in
             let descriptor = FetchDescriptor<TestUser>(predicate: #Predicate { $0.id == id })
-            guard let user = try tx.modelContext.fetch(descriptor).first else { return nil }
+            guard let user = try tx.modelContext.fetch(descriptor).first else { return }
             let previous = user.name
             user.name = name
-            return { context in
+            tx.onRollback { context in
                 try context.fetch(descriptor).first?.name = previous
             }
         }
@@ -391,6 +401,80 @@ struct ProviderMutationTests {
 
         #expect(try localUsers(users)["1"] == "Ada")
         #expect(try localUsers(users)["2"] == "New")
+    }
+
+    @Test("Overlapping unscoped calls through one mutation observer don't roll back over each other")
+    func observerOverlappingCalls() async throws {
+        let (provider, users, server) = try await loaded(observed: false)
+        let renames = MutationObserver<Void, String>(provider: provider, invalidates: [.type(TestUser.self)])
+        await server.checkpoints.hold("rename:Old")
+
+        _ = { renames.mutate({
+            try await server.rename(id: "1", to: "Old", fail: true)
+        }, optimistic: renameRow("1", to: "Old")) }()
+        await server.checkpoints.reached("rename:Old")
+        try await renames.mutate({
+            try await server.rename(id: "1", to: "New")
+        }, optimistic: renameRow("1", to: "New"))
+        await server.checkpoints.release("rename:Old")
+        await eventually { !renames.isMutating }
+        await users.settle()
+
+        // Rolling back would restore "Ada" over the newer edit; the key refetches instead.
+        #expect(try localUsers(users)["1"] == "New")
+    }
+
+    @Test("Overlapping unscoped provider mutations don't roll back over each other")
+    func providerOverlappingMutations() async throws {
+        let (provider, users, server) = try await loaded(observed: false)
+        await server.checkpoints.hold("rename:Old")
+
+        let older = Task {
+            try await provider.mutate(invalidates: [.key(users)]) {
+                try await server.rename(id: "1", to: "Old", fail: true)
+            } optimistic: { tx in try renameRow("1", to: "Old")(tx) }
+        }
+        await server.checkpoints.reached("rename:Old")
+        try await provider.mutate(invalidates: [.type(TestUser.self)]) {
+            try await server.rename(id: "1", to: "New")
+        } optimistic: { tx in try renameRow("1", to: "New")(tx) }
+        await server.checkpoints.release("rename:Old")
+        await #expect(throws: ServerError.self) { try await older.value }
+        await users.settle()
+
+        #expect(try localUsers(users)["1"] == "New")
+    }
+
+    @Test("Rollbacks run newest first, and also when the optimistic update throws")
+    func rollbackOrder() async throws {
+        let (provider, users, server) = try await loaded(observed: false)
+        var log: [String] = []
+        struct Failure: Error {}
+
+        await #expect(throws: ServerError.self) {
+            try await provider.mutate {
+                try await server.rename(id: "1", to: "X", fail: true)
+            } optimistic: { tx in
+                tx.onRollback { _ in log.append("first") }
+                tx.onRollback { _ in log.append("second") }
+            }
+        }
+        #expect(log == ["second", "first"])
+
+        log = []
+        await #expect(throws: Failure.self) {
+            try await provider.mutate {
+                try await server.rename(id: "1", to: "Never")
+            } optimistic: { tx in
+                try renameRow("1", to: "Half")(tx)
+                tx.onRollback { _ in log.append("undone") }
+                throw Failure()
+            }
+        }
+        #expect(log == ["undone"])
+        #expect(try localUsers(users)["1"] == "Ada")
+        #expect(await server.renameLog.isEmpty == false) // only the first mutation was sent
+        #expect(await server.renameLog.contains("start:Never") == false)
     }
 
     @Test("A skipped rollback refetches the client's data once no optimistic mutation covers it, even when no view shows it")
@@ -441,7 +525,6 @@ struct ProviderMutationTests {
                 try await server.rename(id: "1", to: "Old", fail: true)
             } optimistic: { tx in
                 tx.setQueryData(for: TestUser.self) { $0.etag = 99 }
-                return nil
             }
         }
         await server.checkpoints.reached("rename:Old")
@@ -449,7 +532,6 @@ struct ProviderMutationTests {
             try await server.rename(id: "2", to: "New")
         } optimistic: { tx in
             tx.setQueryData(for: TestDetail(id: "1")) { $0.version = 99 }
-            return nil
         }
         await server.checkpoints.release("rename:Old")
         await #expect(throws: ServerError.self) { try await older.value }
@@ -618,7 +700,6 @@ struct ProviderMutationTests {
                 try await server.rename(id: "1", to: "Ada L.")
             } optimistic: { tx in
                 tx.setQueryData(for: TestUser.self) { $0.etag = 99 }
-                return nil
             }
         }
         await server.checkpoints.reached("rename:Ada L.")
