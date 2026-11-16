@@ -360,7 +360,7 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
         key: String,
         in context: ModelContext
     ) -> (Fetcher.QueryData, Data, stale: Bool)? {
-        guard let record = try? context.fetch(QueryRecord.descriptor(key: key, limit: 1)).first,
+        guard let record = try? QueryRecord.latest(context.fetch(QueryRecord.descriptor(key: key))),
               let data = record.stateData,
               let lastSyncedAt = record.lastSyncedAt,
               let value = try? JSONDecoder().decode(Fetcher.QueryData.self, from: data)
@@ -387,6 +387,8 @@ protocol AnyQueryObserver: AnyObject {
     var tagSet: Set<String> { get }
     var isActive: Bool { get }
     var isObserved: Bool { get }
+    /// Whether nothing was fetched and no fetch is running.
+    var isUnfetched: Bool { get }
     var isModel: Bool { get }
     var idleGeneration: UInt64 { get set }
     func collectGarbage() async -> Bool
@@ -407,5 +409,6 @@ protocol AnyQueryObserver: AnyObject {
 
 extension QueryObserver: AnyQueryObserver {
     var tagSet: Set<String> { fetcher.tags }
+    var isUnfetched: Bool { state.isPending && fetchStatus == .idle }
     var isModel: Bool { Fetcher.self is any ModelFetcherKind.Type }
 }

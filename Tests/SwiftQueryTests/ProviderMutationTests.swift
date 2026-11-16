@@ -71,6 +71,17 @@ struct ProviderMutationTests {
         #expect(!other.state.isStale)
     }
 
+    @Test("refetch skips keys that were never fetched")
+    func refetchSkipsUnfetched() async throws {
+        let (provider, _, server) = try await loaded(observed: true)
+        let detail = provider.client(for: TestDetail(id: "1"))
+        let fetches = await server.fetchCount
+
+        await provider.refetch(.tag("users"), type: .all)
+        #expect(await server.fetchCount == fetches)
+        #expect(detail.state.isPending)
+    }
+
     @Test("refetch fetches active keys by default, and inactive ones on request")
     func refetchTypes() async throws {
         let (provider, users, _) = try await loaded(observed: true)

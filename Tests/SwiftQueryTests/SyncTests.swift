@@ -319,6 +319,46 @@ struct SyncTests {
         #expect(records.count == 1)
     }
 
+    @Test("Among duplicates, a record that never synced counts as the oldest")
+    func duplicateRecordsWithoutSync() async throws {
+        let container = try makeContainer()
+        let encode = { (etag: Int) in try JSONEncoder().encode(TestUser.QueryData(etag: etag)) }
+        let context = container.mainContext
+        context.insert(QueryRecord(key: TestUser.queryKey, stateData: try encode(7), lastSyncedAt: .now))
+        context.insert(QueryRecord(key: TestUser.queryKey, stateData: try encode(3), lastSyncedAt: .now - 60))
+        context.insert(QueryRecord(key: TestUser.queryKey))
+        try context.save()
+
+        let (provider, _, server) = try makeProvider(container)
+        #expect(provider.getQueryData(for: TestUser.self) == .init(etag: 7))
+        let client = provider.client(for: TestUser.self)
+        client.sync()
+        await client.settle()
+
+        #expect(client.data == .init(etag: 7))
+        #expect(await server.fetchCount == 0)
+        #expect(try context.fetch(FetchDescriptor<QueryRecord>()).count == 1)
+    }
+
+    @Test("Checking unchanged state doesn't decode it again")
+    func validatedStateIsNotDecodedAgain() async throws {
+        let provider = QueryProvider(modelContainer: try makeContainer(), fetchers: TestCounted.self)
+        let client = provider.client(for: TestCounted())
+        client.sync()
+        await client.settle()
+        #expect(client.data?.value == 1)
+        // The first check after a fetch decodes its new data once.
+        client.sync()
+        await client.settle()
+
+        let decodes = DecodeCounter.shared.count
+        for _ in 0..<5 {
+            client.sync()
+        }
+        await client.settle()
+        #expect(DecodeCounter.shared.count == decodes)
+    }
+
     @Test("Unchanged snapshots don't invalidate observers")
     func quietSnapshots() async throws {
         let (_, client, _) = try makeProvider()

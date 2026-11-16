@@ -381,3 +381,38 @@ extension QueryModel {
     /// The model's record key.
     static var queryKey: String { String(reflecting: Self.self) }
 }
+
+/// Counts how many times ``CountedValue`` is decoded.
+final class DecodeCounter: @unchecked Sendable {
+    static let shared = DecodeCounter()
+    private let lock = NSLock()
+    private var value = 0
+
+    var count: Int { lock.withLock { value } }
+    func increment() { lock.withLock { value += 1 } }
+}
+
+struct CountedValue: Codable, Equatable {
+    var value: Int
+
+    init(value: Int) { self.value = value }
+
+    init(from decoder: any Decoder) throws {
+        DecodeCounter.shared.increment()
+        value = try decoder.singleValueContainer().decode(Int.self)
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(value)
+    }
+}
+
+/// A persisted fetcher whose data counts its decodes.
+struct TestCounted: QueryFetcher {
+    var cache: QueryCache? { .forever() }
+
+    func fetch(context: ModelContext, fetchContext: Void, previous: CountedValue?) async throws -> CountedValue {
+        CountedValue(value: 1)
+    }
+}

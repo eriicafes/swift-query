@@ -80,6 +80,8 @@ actor QueryActor<Fetcher: QueryFetcher> {
     /// up to this much early, which is negligible next to cache times measured in minutes.
     static var accessResolution: TimeInterval { 60 }
     private var stateWriter: QueryDataWriter<Fetcher.QueryData>?
+    /// The last stored data known to decode. See `isDecodable`.
+    private var validatedData: Data?
 
     init(
         fetcher: Fetcher,
@@ -189,7 +191,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
         loadIfNeeded()
         let record = try record()
         if let data = record.stateData, let lastSyncedAt = record.lastSyncedAt,
-           Self.isDecodable(data), !record.invalidated {
+           isDecodable(data), !record.invalidated {
             let fresh = switch staleTime {
             case nil: !(lastCache ?? defaultCache).isStale(lastSyncedAt: lastSyncedAt, now: .now)
             case .infinite: true
@@ -235,19 +237,27 @@ actor QueryActor<Fetcher: QueryFetcher> {
 
     /// Cancels the in-flight fetch and applies an optimistic update to the current data, keeping
     /// its sync time and staleness. Returns the data before and after the update, or `nil` if
-    /// there is no data.
+    /// there is no data. A key without data keeps its fetch.
+    ///
+    /// The client shows the update before this runs. When it can't be applied, the stored state
+    /// is published again so the client stops showing data that was never stored.
     func applyOptimistic(_ update: Write) async -> (previous: Data, applied: Data)? {
         loadIfNeeded()
+        guard case .success(let previous, let stale) = status,
+              var value = Self.decodedState(previous)
+        else {
+            await publish()
+            return nil
+        }
         if let inFlight {
             optimisticallyCancelledFetch = inFlight.id
             inFlight.task.cancel()
         }
-        guard case .success(let previous, let stale) = status,
-              var value = Self.decodedState(previous)
-        else { return nil }
         update(&value)
-        guard let applied = try? JSONEncoder().encode(value) else { return nil }
-        guard store(applied, stale: stale) else { return nil }
+        guard let applied = try? JSONEncoder().encode(value), store(applied, stale: stale) else {
+            await publish()
+            return nil
+        }
         await publish()
         return (previous, applied)
     }
@@ -456,7 +466,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
 
     private func performFetch(id: UInt64) async {
         let generation = invalidations
-        let storedData = (try? record().stateData).flatMap { Self.isDecodable($0) ? $0 : nil }
+        let storedData = (try? record().stateData).flatMap { isDecodable($0) ? $0 : nil }
         fetchStatus = .fetching
         await publish()
 
@@ -541,7 +551,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
     /// Calls `subscribe` if no subscription task is running, and keeps the task it returns.
     private func ensureSubscribed() {
         guard subscriptionTask == nil else { return }
-        let storedData = (try? record().stateData).flatMap { Self.isDecodable($0) ? $0 : nil }
+        let storedData = (try? record().stateData).flatMap { isDecodable($0) ? $0 : nil }
         guard let task = Self.runSubscribe(
             fetcher: fetcher,
             stateData: storedData,
@@ -594,7 +604,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
     private func freshness(of record: QueryRecord, cache: QueryCache, now: Date) -> (Data, Bool)? {
         guard let data = record.stateData,
               let lastSyncedAt = record.lastSyncedAt,
-              Self.isDecodable(data)
+              isDecodable(data)
         else { return nil }
         let stale = record.invalidated || cache.isStale(lastSyncedAt: lastSyncedAt, now: now)
         return (data, stale)
@@ -672,8 +682,13 @@ actor QueryActor<Fetcher: QueryFetcher> {
         return try? JSONEncoder().encode(state)
     }
 
-    private static func isDecodable(_ data: Data) -> Bool {
-        (try? JSONDecoder().decode(Fetcher.QueryData.self, from: data)) != nil
+    /// Whether `data` decodes as `QueryData`. The last data known to decode is remembered, so
+    /// checking unchanged state compares bytes instead of decoding it again.
+    private func isDecodable(_ data: Data) -> Bool {
+        if data == validatedData { return true }
+        guard Self.decodedState(data) != nil else { return false }
+        validatedData = data
+        return true
     }
 
     private static func decodedState(_ data: Data?) -> Fetcher.QueryData? {
@@ -742,9 +757,9 @@ actor QueryActor<Fetcher: QueryFetcher> {
             return record
         }
         let records = try modelContext.fetch(QueryRecord.descriptor(key: key))
-        if let keep = records.first {
+        if let keep = QueryRecord.latest(records) {
             if records.count > 1 {
-                for extra in records.dropFirst() {
+                for extra in records where extra !== keep {
                     modelContext.delete(extra)
                 }
                 try modelContext.save()

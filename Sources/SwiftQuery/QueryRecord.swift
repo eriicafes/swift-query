@@ -53,14 +53,15 @@ public final class QueryRecord {
 }
 
 extension QueryRecord {
-    /// Records for `key`, most recently synced first.
-    static func descriptor(key: String, limit: Int? = nil) -> FetchDescriptor<QueryRecord> {
-        var descriptor = FetchDescriptor<QueryRecord>(
-            predicate: #Predicate { $0.key == key },
-            sortBy: [SortDescriptor(\.lastSyncedAt, order: .reverse)]
-        )
-        descriptor.fetchLimit = limit
-        return descriptor
+    /// Records for `key`. A key normally has one; pick among duplicates with ``latest(_:)``.
+    static func descriptor(key: String) -> FetchDescriptor<QueryRecord> {
+        FetchDescriptor<QueryRecord>(predicate: #Predicate { $0.key == key })
+    }
+
+    /// The most recently synced of `records`; a record that never synced counts as the oldest.
+    /// Chosen in memory because how a store sorts `nil` dates isn't defined.
+    static func latest(_ records: [QueryRecord]) -> QueryRecord? {
+        records.max { ($0.lastSyncedAt ?? .distantPast) < ($1.lastSyncedAt ?? .distantPast) }
     }
 }
 

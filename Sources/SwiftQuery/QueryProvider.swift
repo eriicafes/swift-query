@@ -386,8 +386,8 @@ public final class QueryProvider {
     ///
     /// `type` picks which keys: `.active` (the default) refetches keys shown in a view;
     /// `.inactive` refetches every other key the provider knows about, including stored keys of
-    /// listed types that have no client; `.all` refetches both. A key that was never fetched has
-    /// nothing to refetch. To fetch any key unconditionally, use ``query(_:staleTime:)-(F,_)``
+    /// listed types that have no client; `.all` refetches both. A key that was never fetched, or whose
+    /// data was removed, has nothing to refetch. To fetch any key unconditionally, use ``query(_:staleTime:)-(F,_)``
     /// with `staleTime: .after(.zero)`.
     public func refetch(_ filters: QueryFilter..., type: QueryType = .active) async {
         await refetch(filters, type: type)
@@ -559,11 +559,13 @@ public final class QueryProvider {
     }
 
     private func refetch(_ filters: [QueryFilter], type: QueryType) async {
+        // A key that was never fetched has nothing to refetch; one whose first fetch is in
+        // flight is joined.
         var refreshes: [@MainActor () async -> Void] = liveClients(matching: filters)
-            .filter { type.includes(observed: $0.isObserved) }
+            .filter { type.includes(observed: $0.isObserved) && !$0.isUnfetched }
             .map { client in { await client.refresh() } }
         if type.includes(observed: false) {
-            for record in storedRecords(matching: filters, in: bookkeepingContext()) {
+            for record in storedRecords(matching: filters, in: bookkeepingContext()) where record.stateData != nil {
                 guard let entry = entries[QueryRecord.Key.typeName(of: record.key)] else { continue }
                 let key = record.key
                 refreshes.append { await entry.refresh(key, self) }
