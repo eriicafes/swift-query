@@ -455,7 +455,7 @@ The provider's other operations take the same filters:
 | `invalidate` | Marks data as stale; shown data is fetched again |
 | `refetch` | Fetches now |
 | `cancel` | Stops fetches in progress and keeps the previous data |
-| `remove` | Deletes the data, running `evict` |
+| `remove` | Stops fetches in progress, then deletes the data, running `evict` |
 | `reset` | Removes the data, then fetches it again for views showing it |
 
 `refetch` fetches data shown in a view. Pass `type: .inactive` to fetch the rest instead, including data saved earlier that nothing has used yet, or `type: .all` for both:
@@ -467,7 +467,9 @@ await provider.refetch(.all, type: .all)            // everything, for example a
 
 A single client offers the same for its own data: `client.sync()` fetches if stale, `client.refresh()` always fetches, and `client.cancel()` stops a fetch in progress.
 
-When data is removed, everything that shares a tag with it is invalidated, so details refetch after the list they belong to is removed.
+When data is removed, everything that shares a tag with it is invalidated, so details refetch after the list they belong to is removed. Keys removed together don't count: `remove(.tag("users"))` doesn't refetch any of the keys it removes.
+
+A cancelled fetch never saves the rows it left in `context`. Rows a fetcher saved itself before it was cancelled stay, except when it was cancelled by `remove` or `reset`: those wait for the fetch to stop, then evict. So a fetcher that saves on its own should check for cancellation first, with `try Task.checkCancellation()`.
 
 ## Mutations
 

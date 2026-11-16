@@ -326,6 +326,82 @@ struct FetcherTests {
         _ = subscription
     }
 
+    @Test("Rows a fetch in flight writes don't reappear after remove", arguments: [false, true])
+    func removeDuringFetch(fetcherSaves: Bool) async throws {
+        let (provider, client, server) = try makeProvider(saves: fetcherSaves)
+        client.sync()
+        await client.settle()
+        #expect(try localUsers(client).count == 2)
+
+        await server.checkpoints.hold("fetch")
+        client.sync(.forever(refreshAfter: .zero))
+        await server.checkpoints.reached("fetch", count: 2)
+        let removal = Task { await provider.remove(.type(TestUser.self)) }
+        await server.checkpoints.reached("fetch-cancelled")
+        await server.checkpoints.release("fetch")
+        await removal.value
+        await client.settle()
+
+        #expect(try localUsers(client).isEmpty)
+        #expect(client.state.isPending)
+    }
+
+    @Test("A cancelled fetch doesn't save the rows it inserted")
+    func cancelledFetchUnsaved() async throws {
+        let (provider, client, server) = try makeProvider(saves: false)
+        client.sync()
+        await client.settle()
+        _ = try await server.rename(id: "1", to: "Changed")
+
+        await server.checkpoints.hold("fetch")
+        client.sync(.forever(refreshAfter: .zero))
+        await server.checkpoints.reached("fetch", count: 2)
+        provider.cancel(.type(TestUser.self))
+        await server.checkpoints.reached("fetch-cancelled")
+        await server.checkpoints.release("fetch")
+        await client.settle()
+
+        // The fixture's batch delete reaches the store on its own; its inserts must not.
+        #expect(!(try localUsers(client)).values.contains("Changed"))
+        #expect(client.data == .init(etag: 1))
+    }
+
+    @Test("Keys removed together don't refetch each other through a shared tag")
+    func removeSharedTag() async throws {
+        let (provider, _, server) = try makeProvider()
+        let one = provider.client(for: TestDetail(id: "1"))
+        let two = provider.client(for: TestDetail(id: "2"))
+        let subscriptions = (await observe(one), await observe(two))
+        let fetches = await server.fetchCount
+
+        await provider.remove(.tag("users"))
+        await one.settle()
+        await two.settle()
+        #expect(await server.fetchCount == fetches)
+        #expect(one.state.isPending)
+        #expect(two.state.isPending)
+        #expect(try profiles(provider).isEmpty)
+        _ = subscriptions
+    }
+
+    @Test("reset refetches each shown key once, after every key is removed")
+    func resetSharedTag() async throws {
+        let (provider, _, server) = try makeProvider()
+        let one = provider.client(for: TestDetail(id: "1"))
+        let two = provider.client(for: TestDetail(id: "2"))
+        let subscriptions = (await observe(one), await observe(two))
+        let fetches = await server.fetchCount
+
+        await provider.reset(.tag("users"))
+        await one.settle()
+        await two.settle()
+        #expect(await server.fetchCount == fetches + 2)
+        #expect(one.data != nil)
+        #expect(two.data != nil)
+        #expect(try profiles(provider) == ["1": "Ada", "2": "Grace"])
+        _ = subscriptions
+    }
+
     @Test("refetch with type .inactive or .all fetches stored keys that have no client")
     func refetchStored() async throws {
         let (provider, _, server) = try makeProvider(keepAliveTime: .zero)

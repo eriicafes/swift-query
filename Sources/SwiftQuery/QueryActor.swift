@@ -23,7 +23,8 @@ struct QuerySnapshot: Sendable {
 actor QueryActor<Fetcher: QueryFetcher> {
     typealias Publisher = @Sendable (QuerySnapshot) async -> Void
     typealias Write = @Sendable (inout Fetcher.QueryData) -> Void
-    /// Invalidates other keys that share an evicted key's tags.
+    /// Invalidates other keys that share an evicted key's tags. Called when a sync evicts an
+    /// expired key; `remove` and `collectGarbage` return instead, so the provider can batch.
     typealias EvictHandler = @Sendable (_ tags: Set<String>, _ key: String) async -> Void
 
     nonisolated let modelContainer: ModelContainer
@@ -312,42 +313,54 @@ actor QueryActor<Fetcher: QueryFetcher> {
     }
 
     /// Cancels any fetch and subscription task, then evicts the key's data and clears its state.
-    func remove() async {
+    /// Returns whether the key was evicted. The caller invalidates keys sharing its tags.
+    ///
+    /// Waits for a cancelled fetch to finish before evicting, so rows it saves (including rows
+    /// the fetcher saved itself) are evicted too instead of reappearing afterwards.
+    func remove() async -> Bool {
         loadIfNeeded()
-        inFlight?.task.cancel()
+        // A sync while waiting may start another fetch; it is cancelled in turn.
+        while let inFlight {
+            inFlight.task.cancel()
+            await inFlight.task.value
+        }
+        // No suspension between the loop and eviction, so no fetch can start in between.
         pendingWrites.removeAll()
+        let evicted: Bool
         do {
             try evict(try record())
+            evicted = true
         } catch {
             rollback()
             lastError = error
+            evicted = false
         }
         await publish()
-        await onEvict(fetcher.tags, key)
+        return evicted
     }
 
-    /// Removes the key, then syncs it again if a view still shows it.
-    func reset() async {
-        await remove()
-        if observers > 0 {
-            await sync(lastCache ?? defaultCache, checkExpiry: false)
-            ensureSubscribed()
-        }
+    /// Syncs again if a view still shows the key. Used by `reset` after removing it.
+    func resyncIfObserved() async {
+        guard observers > 0 else { return }
+        await sync(lastCache ?? defaultCache, checkExpiry: false)
+        ensureSubscribed()
     }
 
     /// Evicts the key if it expired while unobserved and idle, under the cache policy of the
-    /// most recent sync, or the key's own policy if there hasn't been one.
-    func collectGarbage() async {
+    /// most recent sync, or the key's own policy if there hasn't been one. Returns whether it
+    /// was evicted. The caller invalidates keys sharing its tags.
+    func collectGarbage() async -> Bool {
         loadIfNeeded()
-        guard observers == 0, inFlight == nil else { return }
+        guard observers == 0, inFlight == nil else { return false }
         do {
             if try evictIfExpired(try record(), cache: lastCache ?? defaultCache, now: .now) {
                 await publish()
-                await onEvict(fetcher.tags, key)
+                return true
             }
         } catch {
             rollback()
         }
+        return false
     }
 
     /// Cancels the subscription task. The next sync from a view calls `subscribe` again.
@@ -682,6 +695,9 @@ actor QueryActor<Fetcher: QueryFetcher> {
             fetchContext: fetchContext,
             previous: decodedState(stateData)
         )
+        // A fetch cancelled while running (by removal or an optimistic update) must not save
+        // its rows over the eviction or the edit.
+        try Task.checkCancellation()
         if context.hasChanges {
             try context.save()
         }

@@ -33,7 +33,13 @@ actor FakeServer {
         requestedEtags.append(requested)
         // The response reflects the server when the request arrived, like a real round trip.
         let snapshot = users
-        await checkpoints.pass("fetch")
+        let checkpoints = checkpoints
+        await withTaskCancellationHandler {
+            await checkpoints.pass("fetch")
+        } onCancel: {
+            // Lets tests wait until a held fetch has been cancelled.
+            Task { await checkpoints.pass("fetch-cancelled") }
+        }
         if !failures.isEmpty { throw failures.removeFirst() }
         etag += 1
         return (snapshot, etag)

@@ -257,14 +257,16 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
         await actor.setQueryData(data)
     }
 
-    func remove() async {
+    /// Removes the key's data. Returns whether it was evicted.
+    func remove() async -> Bool {
         await tail?.value
-        await actor.remove()
+        return await actor.remove()
     }
 
-    func reset() async {
+    /// Syncs again if a view still shows the key, waiting until any fetch has started.
+    func resyncIfObserved() async {
         await tail?.value
-        await actor.reset()
+        await actor.resyncIfObserved()
     }
 
     func isSubscribed() async -> Bool {
@@ -281,9 +283,10 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
         await actor.refetch()
     }
 
-    func collectGarbage() async {
+    /// Evicts the key if its cache expired. Returns whether it was evicted.
+    func collectGarbage() async -> Bool {
         await tail?.value
-        await actor.collectGarbage()
+        return await actor.collectGarbage()
     }
 
     /// Waits for scheduled operations and any in-flight fetch to finish.
@@ -389,7 +392,7 @@ protocol AnyQueryObserver: AnyObject {
     var isObserved: Bool { get }
     var isModel: Bool { get }
     var idleGeneration: UInt64 { get set }
-    func collectGarbage() async
+    func collectGarbage() async -> Bool
     func invalidate()
     func resync()
     func refresh() async
@@ -401,8 +404,8 @@ protocol AnyQueryObserver: AnyObject {
     func release() async -> Bool
     func cancel()
     func unsubscribe()
-    func remove() async
-    func reset() async
+    func remove() async -> Bool
+    func resyncIfObserved() async
 }
 
 extension QueryObserver: AnyQueryObserver {

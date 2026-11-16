@@ -27,7 +27,7 @@ Keep the `@Model` class to application data and put the conformance in a separat
 
 In `fetch`:
 
-- Write rows into the provided `context`. The context is fresh per fetch. Pending changes are saved when `fetch` returns, and discarded if it throws.
+- Write rows into the provided `context`. The context is fresh per fetch. Pending changes are saved when `fetch` returns, and discarded if it throws or was cancelled. If `fetch` saves `context` itself, call `try Task.checkCancellation()` first.
 - Read cursors or ETags from `previous?` and return the new data. It is saved once, after `fetch` returns successfully. On a 304, return `previous`.
 - On a 304 or other "no changes" response, don't touch rows.
 - If the app uses MainActor default isolation, mark the conformance extension `nonisolated`, and make the types `fetch` calls into (such as those in its fetch context) `nonisolated` too. Otherwise each call hops back to the main actor and does its work there.

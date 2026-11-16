@@ -126,7 +126,7 @@ public final class QueryProvider {
             fetchContext: fetchContext(F.Context.self),
             provider: self,
             onEvict: { [weak self] tags, key in
-                await self?.invalidateShared(tags: tags, except: key)
+                await self?.invalidateShared(tags: tags, except: [key])
             }
         )
         client.onActivityChange = { [weak self, weak client] in
@@ -394,12 +394,14 @@ public final class QueryProvider {
     }
 
     /// Drops cached state: evicts matching keys' rows, deletes their stored state, and returns
-    /// live clients to `.pending`. Keys sharing a tag with a removed key are invalidated.
+    /// live clients to `.pending`. In-flight fetches are cancelled and waited for first, so rows
+    /// they save are evicted too. Keys sharing a tag with a removed key are invalidated, except
+    /// the keys removed with it.
     public func remove(_ filters: QueryFilter...) async {
         await remove(filters, refetchObserved: false)
     }
 
-    /// Removes matching keys, then syncs the ones a view still shows.
+    /// Removes matching keys, then syncs the ones a view still shows, once every key is removed.
     public func reset(_ filters: QueryFilter...) async {
         await remove(filters, refetchObserved: true)
     }
@@ -411,8 +413,9 @@ public final class QueryProvider {
     /// The provider already runs this at launch and whenever the app goes to the background;
     /// call it yourself only to clean up at another time.
     public func collectGarbage() async {
-        for client in liveClients {
-            await client.collectGarbage()
+        var evicted = Evicted()
+        for client in liveClients where await client.collectGarbage() {
+            evicted.add(client.recordKey, tags: client.tagSet)
         }
         let liveKeys = Set(liveClients.map(\.recordKey))
         let context = bookkeepingContext()
@@ -421,8 +424,9 @@ public final class QueryProvider {
         ))) ?? []
         let now = Date.now
         for record in records where !liveKeys.contains(record.key) && record.isExpired(now: now) {
-            await evictStored(record, in: context)
+            evictStored(record, in: context, into: &evicted)
         }
+        invalidateShared(evicted)
     }
 
     // MARK: Matching
@@ -456,8 +460,8 @@ public final class QueryProvider {
         return context
     }
 
-    private func invalidate(_ filters: [QueryFilter], except excluded: String? = nil) {
-        for client in liveClients(matching: filters) where client.recordKey != excluded {
+    private func invalidate(_ filters: [QueryFilter], except excluded: Set<String> = []) {
+        for client in liveClients(matching: filters) where !excluded.contains(client.recordKey) {
             client.invalidate()
             if client.isObserved {
                 client.resync()
@@ -466,17 +470,24 @@ public final class QueryProvider {
         markStoredInvalidated(filters, except: excluded)
     }
 
-    private func markStoredInvalidated(_ filters: [QueryFilter], except excluded: String? = nil) {
+    private func markStoredInvalidated(_ filters: [QueryFilter], except excluded: Set<String> = []) {
         let context = bookkeepingContext()
-        for record in storedRecords(matching: filters, in: context) where record.key != excluded {
+        for record in storedRecords(matching: filters, in: context) where !excluded.contains(record.key) {
             record.invalidated = true
         }
         try? context.save()
     }
 
-    /// Invalidates other keys that share a tag with an evicted or removed key.
-    func invalidateShared(tags: Set<String>, except key: String) {
-        invalidate(tags.map { .tag($0) }, except: key)
+    /// Invalidates the keys that share a tag with evicted or removed keys, except those keys.
+    func invalidateShared(tags: Set<String>, except keys: Set<String>) {
+        guard !tags.isEmpty else { return }
+        invalidate(tags.map { .tag($0) }, except: keys)
+    }
+
+    /// Invalidates the keys sharing a tag with a batch of evicted keys, once for the whole batch,
+    /// so keys evicted in the same batch don't start fetches and the store is scanned once.
+    private func invalidateShared(_ evicted: Evicted) {
+        invalidateShared(tags: evicted.tags, except: evicted.keys)
     }
 
     /// Whether an optimistic mutation whose remote call hasn't returned covers the client's key.
@@ -557,23 +568,31 @@ public final class QueryProvider {
         }
     }
 
+    /// Removes every matching key first, then invalidates the keys sharing their tags once, so
+    /// keys removed together don't refetch each other. With `refetchObserved`, removed keys a
+    /// view still shows sync again last.
     private func remove(_ filters: [QueryFilter], refetchObserved: Bool) async {
-        for client in liveClients(matching: filters) {
-            if refetchObserved {
-                await client.reset()
-            } else {
-                await client.remove()
-            }
+        var evicted = Evicted()
+        let clients = liveClients(matching: filters)
+        for client in clients where await client.remove() {
+            evicted.add(client.recordKey, tags: client.tagSet)
         }
         let context = bookkeepingContext()
         for record in storedRecords(matching: filters, in: context) {
-            await evictStored(record, in: context)
+            evictStored(record, in: context, into: &evicted)
+        }
+        invalidateShared(evicted)
+        if refetchObserved {
+            for client in clients {
+                await client.resyncIfObserved()
+            }
         }
     }
 
     /// Evicts a stored key that has no client: clears or deletes its record first, then runs the
-    /// type's `evict` if the type is listed and the key still decodes.
-    private func evictStored(_ record: QueryRecord, in context: ModelContext) async {
+    /// type's `evict` if the type is listed and the key still decodes. Adds the key to `evicted`
+    /// if its record was cleared.
+    private func evictStored(_ record: QueryRecord, in context: ModelContext, into evicted: inout Evicted) {
         let key = record.key
         let tags = QueryRecord.Tags.decode(record.tags)
         if QueryRecord.Key.isModel(key) {
@@ -593,7 +612,18 @@ public final class QueryProvider {
                 try? evictContext.save()
             }
         }
-        invalidateShared(tags: tags, except: key)
+        evicted.add(key, tags: tags)
+    }
+}
+
+/// The keys evicted in one batch and their tags, for invalidating the keys that share them.
+struct Evicted {
+    private(set) var keys: Set<String> = []
+    private(set) var tags: Set<String> = []
+
+    mutating func add(_ key: String, tags: Set<String>) {
+        keys.insert(key)
+        self.tags.formUnion(tags)
     }
 }
 

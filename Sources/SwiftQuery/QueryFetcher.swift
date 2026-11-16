@@ -45,8 +45,9 @@ public protocol QueryFetcher: Queryable, Hashable, Codable, Sendable {
     /// `previous` is the data from the last successful fetch, or `nil` before the first one;
     /// read cursors or ETags from it. Runs outside any actor and counts as complete when it
     /// returns. Pending changes in `context` are saved after it returns and discarded if it
-    /// throws. The returned data is saved once, after a successful fetch. Check for
-    /// cancellation in long work.
+    /// throws or was cancelled. The returned data is saved once, after a successful fetch. Check
+    /// for cancellation in long work, and before saving `context` yourself, so a cancelled fetch
+    /// can't overwrite an optimistic edit.
     func fetch(context: ModelContext, fetchContext: Context, previous: QueryData?) async throws -> QueryData
 
     /// Subscribes to live updates, such as messages from a socket, by returning a task that runs
