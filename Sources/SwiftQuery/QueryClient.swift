@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Connects a view to the shared ``ModelQueryClient`` for a key and syncs it while the view is
+/// Connects a view to the shared ``QueryObserver`` for a key and syncs it while the view is
 /// alive.
 ///
 /// ```swift
@@ -34,7 +34,7 @@ public struct QueryClient<Fetcher: QueryFetcher>: DynamicProperty {
     }
 
     @MainActor
-    public var wrappedValue: ModelQueryClient<Fetcher> {
+    public var wrappedValue: QueryObserver<Fetcher> {
         provider.client(for: fetcher)
     }
 
@@ -56,13 +56,13 @@ public struct QueryClient<Fetcher: QueryFetcher>: DynamicProperty {
 /// its scene becomes active again, never on plain body re-evaluations.
 @MainActor
 final class Subscription<Fetcher: QueryFetcher> {
-    private var client: ModelQueryClient<Fetcher>?
+    private var client: QueryObserver<Fetcher>?
     private var phase: ScenePhase?
 
     nonisolated init() {}
 
     func activate(
-        _ client: ModelQueryClient<Fetcher>,
+        _ client: QueryObserver<Fetcher>,
         cache: QueryCache?,
         phase: ScenePhase = .active,
         onBackground: (@MainActor () -> Void)? = nil

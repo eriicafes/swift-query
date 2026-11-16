@@ -2,9 +2,6 @@ import Foundation
 import Observation
 import SwiftData
 
-/// Reverts an optimistic update. Captures whatever previous values it needs.
-public typealias MutationRollback = @MainActor (ModelContext) throws -> Void
-
 /// The observable, main-actor interface to one key's synchronization: a model collection or a
 /// ``QueryFetcher`` value.
 ///
@@ -13,7 +10,7 @@ public typealias MutationRollback = @MainActor (ModelContext) throws -> Void
 /// ``data``.
 @Observable
 @MainActor
-public final class ModelQueryClient<Fetcher: QueryFetcher> {
+public final class QueryObserver<Fetcher: QueryFetcher> {
     /// The query state: its status, data and staleness.
     public private(set) var state: QueryState<Fetcher.QueryData> = .pending
     /// The current fetch activity.
@@ -41,11 +38,11 @@ public final class ModelQueryClient<Fetcher: QueryFetcher> {
     @ObservationIgnored private var tail: Task<Void, Never>?
     @ObservationIgnored private var lastSequence: UInt64 = 0
     @ObservationIgnored private var stateData: Data?
-    @ObservationIgnored private let scheduler: MutationScheduler
+    @ObservationIgnored let provider: QueryProvider
     /// Bookkeeping for this client's unscoped mutations, which run in parallel.
     @ObservationIgnored private let unscoped = MutationGroup()
     @ObservationIgnored private var observerCount = 0
-    @ObservationIgnored private var mutationCount = 0
+    private var mutationCount = 0
     @ObservationIgnored private var wasActive = false
     /// Told whenever the client starts or stops being in use, so the provider can keep or drop it.
     @ObservationIgnored var onActivityChange: (@MainActor () -> Void)?
@@ -58,14 +55,14 @@ public final class ModelQueryClient<Fetcher: QueryFetcher> {
         recordKey: String,
         modelContainer: ModelContainer,
         fetchContext: Fetcher.Context,
-        scheduler: MutationScheduler = MutationScheduler(),
+        provider: QueryProvider,
         onEvict: @escaping QueryActor<Fetcher>.EvictHandler = { _, _ in }
     ) {
         let sink = SnapshotSink<Fetcher>()
         self.fetcher = fetcher
         self.recordKey = recordKey
         self.modelContainer = modelContainer
-        self.scheduler = scheduler
+        self.provider = provider
         self.actor = QueryActor(
             fetcher: fetcher,
             key: recordKey,
@@ -134,49 +131,33 @@ public final class ModelQueryClient<Fetcher: QueryFetcher> {
 
     // MARK: Mutations
 
-    /// Runs a remote mutation, optionally applying an optimistic update first.
+    /// Whether a mutation started with ``mutate(scope:invalidates:_:optimistic:)`` is queued,
+    /// running, or waiting for its keys to refetch. In a scope, only the last mutation waits for
+    /// the refetch.
+    public var isMutating: Bool { mutationCount > 0 }
+
+    /// Runs a remote mutation with ``QueryProvider/mutate(scope:invalidates:_:optimistic:)``,
+    /// adding this client's key to `invalidates`.
     ///
-    /// - The optimistic update applies immediately, on the main context, which is then saved so a
-    ///   later refetch can't be overwritten by an unsaved edit. Rollbacks are saved the same way.
-    ///   If that save fails, the update's rollback runs and the error is rethrown before anything
-    ///   is sent. With `autosaveEnabled` off, nothing is saved for you: save in your closures.
-    /// - The remote call runs in its own task, so cancelling the caller doesn't cancel a call that
-    ///   was already sent; the caller still gets its result. A caller cancelled before its call is
-    ///   sent rolls back and throws `CancellationError`.
-    /// - On success, optimistic changes are kept and the client awaits a fetch that starts after
-    ///   the mutation, so a fetch already in flight (possibly sent before the mutation reached the
-    ///   server) can't leave stale data behind. A failed refresh does not roll back or throw; it is
-    ///   reported through ``state`` and ``error``.
-    /// - On failure, the returned rollback runs and the mutation error is rethrown. If a newer
-    ///   optimistic mutation has started since, the rollback is skipped so it cannot clobber the
-    ///   newer change, and the client refetches once no mutations are pending.
+    /// ```swift
+    /// try await postsClient.mutate {
+    ///     try await api.deletePost(id)
+    /// } optimistic: { tx in
+    ///     let post = try tx.modelContext.fetch(descriptor).first
+    ///     post.map(tx.modelContext.delete)
+    ///     return nil
+    /// }
+    /// ```
     ///
-    /// Mutation failures never change ``state`` to `.error`.
-    ///
-    /// A refetch writes the server's current data straight to SwiftData. If it runs while another
-    /// mutation's remote call is still in flight, that mutation's optimistic edit can briefly show
-    /// the server's older value until its own refetch. Put related mutations in one scope to avoid
-    /// this.
-    ///
-    /// ### Scopes
-    ///
-    /// Mutations with the same `scope` send their remote calls one at a time, in call order, even
-    /// across models registered with the same ``QueryProvider``. Mutations without a scope run in
-    /// parallel. A per-record scope such as `"user-\(id)"` is typical. Always use the same scope (or
-    /// always none) for a given record: rollbacks are only skipped in favor of newer optimistic
-    /// mutations in the same scope.
-    ///
-    /// Within a scope, optimistic updates still apply immediately, a failure doesn't cancel later
-    /// mutations, and each error goes only to its own caller. The refetch runs once the scope has
-    /// nothing left queued, for every model a mutation in it touched, and only the caller of the
-    /// last mutation awaits it. A caller cancelled while queued stops waiting right away, rolls back,
-    /// and throws `CancellationError` without sending its remote call; later mutations keep their
-    /// order.
+    /// An unscoped mutation that fails skips its rollback when a newer optimistic mutation has
+    /// started from this client since, so it can't clobber the newer change. This client's data
+    /// then refetches even if no view shows it.
     @discardableResult
     public func mutate<Result>(
         scope: (any Hashable & Sendable)? = nil,
+        invalidates: [QueryFilter] = [],
         _ mutation: @escaping @Sendable () async throws -> sending Result,
-        optimistic: (@MainActor (ModelContext) throws -> MutationRollback?)? = nil
+        optimistic: (@MainActor (OptimisticContext) throws -> MutationRollback?)? = nil
     ) async throws -> Result {
         mutationCount += 1
         activityChanged()
@@ -184,155 +165,67 @@ public final class ModelQueryClient<Fetcher: QueryFetcher> {
             mutationCount -= 1
             activityChanged()
         }
-        let scopeKey = scope.map { AnyHashable($0) }
-        let group = scopeKey.map { scheduler.group(for: $0) } ?? unscoped
-        let context = modelContainer.mainContext
-
-        var rollback: MutationRollback?
-        var optimisticID: UInt64?
-        if let optimistic {
-            do {
-                rollback = try Self.applyOptimistic(optimistic, in: context)
-            } catch {
-                if let scopeKey { scheduler.release(scopeKey, group) }
-                throw error
-            }
-            group.latestOptimistic &+= 1
-            optimisticID = group.latestOptimistic
-        }
-        group.pending += 1
-
-        // Scoped: wait for the previous mutation's remote call, and let the next one wait for ours.
-        var previous: Task<Void, Never>?
-        var gate: MutationGate?
-        if scopeKey != nil {
-            let ownGate = MutationGate()
-            previous = group.tail
-            let waitFor = previous
-            group.tail = Task {
-                await waitFor?.value
-                await ownGate.wait()
-            }
-            gate = ownGate
-        }
-        await Self.waitForTurn(after: previous)
-
-        let result: Result
-        do {
-            try Task.checkCancellation()
-            result = try await Self.send(mutation)
-        } catch {
-            gate?.open()
-            group.pending -= 1
-            if let rollback {
-                if optimisticID == group.latestOptimistic {
-                    do {
-                        try rollback(context)
-                        try Self.saveIfNeeded(context)
-                    } catch {
-                        group.refetches[ObjectIdentifier(self)] = refetchHandler
-                    }
-                } else {
-                    group.refetches[ObjectIdentifier(self)] = refetchHandler
-                }
-            }
-            await drain(group, scope: scopeKey)
-            throw error
-        }
-        gate?.open()
-        group.pending -= 1
-
-        if scopeKey == nil {
-            // Unscoped: always reconcile right away, covering any skipped rollbacks too.
-            group.refetches[ObjectIdentifier(self)] = nil
-            await refetch()
-        } else {
-            group.refetches[ObjectIdentifier(self)] = refetchHandler
-            await drain(group, scope: scopeKey)
-        }
-        return result
+        let run = try provider.beginMutation(
+            scope: scope,
+            group: unscoped,
+            invalidates: invalidates + [.key(self)],
+            optimistic: optimistic
+        )
+        return try await provider.finishMutation(run, mutation)
     }
 
-    /// Runs the group's refetches once nothing is pending, and forgets a drained scope.
-    private func drain(_ group: MutationGroup, scope: AnyHashable?) async {
-        guard group.pending == 0 else { return }
-        let refetches = Array(group.refetches.values)
-        group.refetches = [:]
-        if let scope {
-            scheduler.release(scope, group)
+    /// Updates the query data optimistically: right away in ``state``, then in storage after
+    /// cancelling the in-flight fetch. Returns a closure that restores the previous data if the
+    /// key still holds this update, or `nil` if there was no data to update.
+    func applyOptimistic(_ update: @escaping QueryActor<Fetcher>.Write) -> (@MainActor () async -> Void)? {
+        guard var value = state.data else { return nil }
+        update(&value)
+        if let data = try? JSONEncoder().encode(value) {
+            stateData = data
+            state = .success(data: value, stale: state.isStale)
         }
-        await withTaskGroup(of: Void.self) { tasks in
-            for refetch in refetches {
-                tasks.addTask { await refetch() }
-            }
+        let previous = tail
+        let actor = actor
+        let write = Task {
+            await previous?.value
+            return await actor.applyOptimistic(update)
         }
-    }
-
-    /// Runs the remote call in its own task, so it outlives a cancelled caller.
-    private static func send<Value>(
-        _ mutation: @escaping @Sendable () async throws -> sending Value
-    ) async throws -> Value {
-        try await withCheckedThrowingContinuation { continuation in
-            Task {
-                do {
-                    continuation.resume(returning: try await mutation())
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
+        tail = Task { _ = await write.value }
+        return {
+            guard let (previous, applied) = await write.value else { return }
+            await actor.restore(previous, ifCurrent: applied)
         }
-    }
-
-    /// Waits for the previous mutation in a scope, returning early if the caller is cancelled.
-    /// Leaving early never reorders the queue: the next mutation still waits for `previous`.
-    private static func waitForTurn(after previous: Task<Void, Never>?) async {
-        guard let previous else { return }
-        let turn = MutationGate()
-        Task {
-            await previous.value
-            turn.open()
-        }
-        await withTaskCancellationHandler {
-            await turn.wait()
-        } onCancel: {
-            Task { @MainActor in turn.open() }
-        }
-    }
-
-    /// Applies an optimistic update and saves it. If the save fails, the update's own rollback
-    /// runs before the error is rethrown, so a mutation that never ran leaves nothing behind.
-    static func applyOptimistic(
-        _ optimistic: @MainActor (ModelContext) throws -> MutationRollback?,
-        in context: ModelContext,
-        save: @MainActor (ModelContext) throws -> Void = saveIfNeeded
-    ) throws -> MutationRollback? {
-        let rollback = try optimistic(context)
-        do {
-            try save(context)
-        } catch {
-            if let rollback {
-                try? rollback(context)
-                try? save(context)
-            }
-            throw error
-        }
-        return rollback
-    }
-
-    /// Saves the main context after an optimistic update or rollback, but only when it autosaves.
-    /// Saving commits every pending change in the shared context, so an app that turned autosave
-    /// off (to hold drafts, for example) keeps control and its closures must save themselves.
-    static func saveIfNeeded(_ context: ModelContext) throws {
-        if context.autosaveEnabled, context.hasChanges {
-            try context.save()
-        }
-    }
-
-    private var refetchHandler: @MainActor () async -> Void {
-        { [weak self] in await self?.refetch() }
     }
 
     // MARK: Internal
+
+    /// Whether syncs are held for an optimistic mutation in flight. Set by the provider.
+    @ObservationIgnored private(set) var isHeld = false
+
+    func hold() {
+        guard !isHeld else { return }
+        isHeld = true
+        enqueue { await $0.hold() }
+    }
+
+    /// Asks for a fetch once the hold ends.
+    func deferFetch() {
+        enqueue { await $0.deferFetch() }
+    }
+
+    /// Ends the hold, returning whether a sync wanted to fetch meanwhile.
+    func release() async -> Bool {
+        guard isHeld else { return false }
+        isHeld = false
+        let previous = tail
+        let actor = actor
+        let released = Task {
+            await previous?.value
+            return await actor.release()
+        }
+        tail = Task { _ = await released.value }
+        return await released.value
+    }
 
     func attach(_ cache: QueryCache?) {
         observerCount += 1
@@ -382,7 +275,8 @@ public final class ModelQueryClient<Fetcher: QueryFetcher> {
         await actor.subscriptions
     }
 
-    private func refetch() async {
+    /// Fetches with a request sent after this call; see ``QueryActor/refetch()``.
+    func refetch() async {
         await tail?.value
         await actor.refetch()
     }
@@ -480,7 +374,7 @@ public final class ModelQueryClient<Fetcher: QueryFetcher> {
 /// Delivers snapshots to a client without the actor retaining it.
 @MainActor
 private final class SnapshotSink<Fetcher: QueryFetcher> {
-    weak var client: ModelQueryClient<Fetcher>?
+    weak var client: QueryObserver<Fetcher>?
 
     func receive(_ snapshot: QuerySnapshot) {
         client?.receive(snapshot)
@@ -488,7 +382,7 @@ private final class SnapshotSink<Fetcher: QueryFetcher> {
 }
 
 @MainActor
-protocol AnyModelQueryClient: AnyObject {
+protocol AnyQueryObserver: AnyObject {
     var recordKey: String { get }
     var tagSet: Set<String> { get }
     var isActive: Bool { get }
@@ -499,13 +393,19 @@ protocol AnyModelQueryClient: AnyObject {
     func invalidate()
     func resync()
     func refresh() async
+    func refetch() async
+    func settleOperations() async
+    var isHeld: Bool { get }
+    func hold()
+    func deferFetch()
+    func release() async -> Bool
     func cancel()
     func unsubscribe()
     func remove() async
     func reset() async
 }
 
-extension ModelQueryClient: AnyModelQueryClient {
+extension QueryObserver: AnyQueryObserver {
     var tagSet: Set<String> { fetcher.tags }
     var isModel: Bool { Fetcher.self is any ModelFetcherKind.Type }
 }

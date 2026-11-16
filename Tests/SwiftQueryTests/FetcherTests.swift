@@ -6,7 +6,7 @@ import Testing
 @MainActor
 @Suite("Fetchers")
 struct FetcherTests {
-    typealias DetailClient = ModelQueryClient<TestDetail>
+    typealias DetailClient = QueryObserver<TestDetail>
 
     func makeRates(
         _ container: ModelContainer? = nil,
@@ -31,7 +31,7 @@ struct FetcherTests {
         try ModelContext(provider.modelContainer).fetch(QueryRecord.descriptor(key: key)).first
     }
 
-    func observe<F: QueryFetcher>(_ client: ModelQueryClient<F>) async -> Subscription<F> {
+    func observe<F: QueryFetcher>(_ client: QueryObserver<F>) async -> Subscription<F> {
         let subscription = Subscription<F>()
         subscription.activate(client, cache: nil)
         await client.settle()
@@ -60,7 +60,7 @@ struct FetcherTests {
         context.insert(QueryRecord(key: "z", tags: QueryRecord.Tags.encode(["A"])))
         try context.save()
 
-        provider.invalidate(tag: "a")
+        provider.invalidate(.tag("a"))
         let invalidated = try ModelContext(provider.modelContainer)
             .fetch(FetchDescriptor<QueryRecord>(predicate: #Predicate { $0.invalidated }))
             .map(\.key)
@@ -156,12 +156,12 @@ struct FetcherTests {
         try context.save()
         let fetches = await server.fetchCount
 
-        provider.invalidate(tag: "user-1")
+        provider.invalidate(.tag("user-1"))
         await one.settle()
         #expect(await server.fetchCount == fetches + 1)
         #expect(one.state.isStale == false)
 
-        provider.invalidate(tag: "users")
+        provider.invalidate(.tag("users"))
         #expect(try record(provider, stored)?.invalidated == true)
         _ = subscription
     }
@@ -174,7 +174,7 @@ struct FetcherTests {
         await one.refresh()
         await two.refresh()
 
-        provider.invalidate(TestDetail.self)
+        provider.invalidate(.type(TestDetail.self))
         await one.settle()
         await two.settle()
         #expect(one.state.isStale)
@@ -247,7 +247,7 @@ struct FetcherTests {
         #expect(try await provider.query(key, staleTime: .infinite) == 1)
         #expect(try await provider.query(key, staleTime: .after(.zero)) == 2)
 
-        provider.invalidate(key)
+        provider.invalidate(.key(key))
         #expect(try await provider.query(key, staleTime: .infinite) == 3)
         #expect(await rates.requests.count == 3)
     }
@@ -287,7 +287,7 @@ struct FetcherTests {
 
         let query = Task { try await provider.query(key, staleTime: .after(.zero)) }
         await rates.checkpoints.reached("rate", count: 2)
-        provider.cancel(TestStoredRate.self)
+        provider.cancel(.type(TestStoredRate.self))
         await provider.client(for: key).settleOperations()
         await rates.checkpoints.release("rate")
 
@@ -303,7 +303,7 @@ struct FetcherTests {
         await one.refresh()
         await two.refresh()
 
-        await provider.remove(TestDetail(id: "1"))
+        await provider.remove(.key(TestDetail(id: "1")))
         await two.settle()
         #expect(one.state.isPending)
         #expect(try profiles(provider) == ["2": "Grace"])
@@ -318,7 +318,7 @@ struct FetcherTests {
         let subscription = await observe(one)
         let fetches = await server.fetchCount
 
-        await provider.reset(tag: "user-1")
+        await provider.reset(.tag("user-1"))
         await one.settle()
         #expect(await server.fetchCount == fetches + 1)
         #expect(try profiles(provider) == ["1": "Ada"])
@@ -326,7 +326,7 @@ struct FetcherTests {
         _ = subscription
     }
 
-    @Test("refetch with includeStored fetches stored keys that have no client")
+    @Test("refetch with type .inactive or .all fetches stored keys that have no client")
     func refetchStored() async throws {
         let (provider, _, server) = try makeProvider(keepAliveTime: .zero)
         do {
@@ -335,10 +335,10 @@ struct FetcherTests {
         await eventually { provider.liveClients.count == 1 }
         let fetches = await server.fetchCount
 
-        await provider.refetch(tag: "users")
+        await provider.refetch(.tag("users"))
         #expect(await server.fetchCount == fetches)
 
-        await provider.refetch(tag: "users", includeStored: true)
+        await provider.refetch(.tag("users"), type: .all)
         #expect(await server.fetchCount == fetches + 1)
     }
 
@@ -349,7 +349,7 @@ struct FetcherTests {
         subscription.activate(client, cache: .swr(staleTime: .seconds(3600), gcTime: .seconds(7)))
         await client.settle()
 
-        provider.invalidate(TestUser.self)
+        provider.invalidate(.type(TestUser.self))
         await client.settleOperations()
         await client.settle()
         #expect(try record(provider, TestUser.queryKey)?.gcTime == 7)

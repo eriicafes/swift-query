@@ -6,8 +6,9 @@ import Testing
 @MainActor
 @Suite("Scoped mutations")
 struct ScopedMutationTests {
-    func rename(id: String, to name: String) -> @MainActor (ModelContext) throws -> MutationRollback? {
-        { context in
+    func rename(id: String, to name: String) -> @MainActor (OptimisticContext) throws -> MutationRollback? {
+        { tx in
+            let context = tx.modelContext
             let descriptor = FetchDescriptor<TestUser>(predicate: #Predicate { $0.id == id })
             guard let user = try context.fetch(descriptor).first else { return nil }
             let previous = user.name
@@ -23,7 +24,7 @@ struct ScopedMutationTests {
 
     func syncedClient() async throws -> (UsersClient, FakeServer, QueryProvider) {
         let (provider, client, server) = try makeProvider()
-        client.sync()
+        client.attach(nil) // shown in a view, so mutations refetch it
         await client.settle()
         return (client, server, provider)
     }
@@ -221,8 +222,11 @@ struct ScopedMutationTests {
         )
         let users = provider.client(for: TestUser.self)
         let feeds = provider.client(for: TestFeed.self)
-        await users.refresh()
-        await feeds.refresh()
+        // Shown in views, so settling refetches them.
+        users.attach(nil)
+        feeds.attach(nil)
+        await users.settle()
+        await feeds.settle()
         await server.checkpoints.hold("rename:Shared")
 
         let first = Task {

@@ -50,6 +50,14 @@ actor QueryActor<Fetcher: QueryFetcher> {
     /// The most recent fetch that was cancelled, so `query` can report it instead of
     /// returning the previous state as if it were the result.
     private var lastCancelledFetch: UInt64?
+    /// The most recent fetch cancelled by an optimistic update, so `query` can return the
+    /// optimistic data instead of failing.
+    private var optimisticallyCancelledFetch: UInt64?
+    /// Whether an optimistic mutation covering this key is in flight. While held, syncs don't
+    /// fetch a key that has data, so the server's older data can't overwrite the edit.
+    private var held = false
+    /// Whether a sync wanted to fetch while the key was held.
+    private var deferredFetch = false
     /// How many fetch requests joined an in-flight fetch instead of starting one.
     private(set) var fetchJoins = 0
     private var invalidations: UInt64 = 0
@@ -191,6 +199,11 @@ actor QueryActor<Fetcher: QueryFetcher> {
         let (id, task) = startFetch()
         await task.value
         if lastCancelledFetch == id {
+            // An optimistic update cancelled the fetch so it couldn't overwrite the edit; the
+            // optimistic data is the key's current data.
+            if optimisticallyCancelledFetch == id, case .success(let data, _) = status {
+                return data
+            }
             throw CancellationError()
         }
         if case .success(let data, _) = status, lastError == nil {
@@ -219,6 +232,46 @@ actor QueryActor<Fetcher: QueryFetcher> {
         await publish()
     }
 
+    /// Cancels the in-flight fetch and applies an optimistic update to the current data, keeping
+    /// its sync time and staleness. Returns the data before and after the update, or `nil` if
+    /// there is no data.
+    func applyOptimistic(_ update: Write) async -> (previous: Data, applied: Data)? {
+        loadIfNeeded()
+        if let inFlight {
+            optimisticallyCancelledFetch = inFlight.id
+            inFlight.task.cancel()
+        }
+        guard case .success(let previous, let stale) = status,
+              var value = Self.decodedState(previous)
+        else { return nil }
+        update(&value)
+        guard let applied = try? JSONEncoder().encode(value) else { return nil }
+        guard store(applied, stale: stale) else { return nil }
+        await publish()
+        return (previous, applied)
+    }
+
+    /// Restores the data from before an optimistic update, if the key still holds that update.
+    func restore(_ previous: Data, ifCurrent applied: Data) async {
+        guard case .success(let current, let stale) = status, current == applied else { return }
+        if store(previous, stale: stale) {
+            await publish()
+        }
+    }
+
+    /// Replaces the stored data without touching its sync time.
+    private func store(_ data: Data, stale: Bool) -> Bool {
+        do {
+            try record().stateData = data
+            try save()
+            status = .success(data, stale: stale)
+            return true
+        } catch {
+            rollback()
+            return false
+        }
+    }
+
     /// Marks the stored state as invalidated without fetching.
     func invalidate() async {
         loadIfNeeded()
@@ -234,6 +287,23 @@ actor QueryActor<Fetcher: QueryFetcher> {
             status = .success(data, stale: true)
             await publish()
         }
+    }
+
+    /// Holds syncs from fetching while an optimistic mutation covering the key is in flight.
+    func hold() {
+        held = true
+    }
+
+    /// Asks for a fetch once the hold ends.
+    func deferFetch() {
+        deferredFetch = true
+    }
+
+    /// Ends a hold. Returns whether a sync wanted to fetch meanwhile; the caller fetches then.
+    func release() -> Bool {
+        held = false
+        defer { deferredFetch = false }
+        return deferredFetch
     }
 
     /// Cancels the in-flight fetch. Rows it already saved stay; its sync state is not saved.
@@ -343,7 +413,11 @@ actor QueryActor<Fetcher: QueryFetcher> {
             return
         }
         if needsFetch {
-            startFetch()
+            if held, case .success = status {
+                deferredFetch = true
+            } else {
+                startFetch()
+            }
         }
         await publish()
         if evicted {

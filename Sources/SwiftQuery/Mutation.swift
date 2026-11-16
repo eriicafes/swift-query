@@ -1,8 +1,67 @@
-/// Shared bookkeeping for a set of mutations: how many are pending, which optimistic update
-/// is newest, and which clients need a refetch once none are pending.
+import Foundation
+import SwiftData
+
+/// Reverts an optimistic update to rows. Captures whatever previous values it needs.
+public typealias MutationRollback = @MainActor (ModelContext) throws -> Void
+
+/// What an optimistic update receives: the main context for editing rows, and a way to update
+/// a key's query data.
 ///
-/// Unscoped mutations use one group per client and run in parallel. Scoped mutations use one
-/// group per scope, shared across clients, and their remote calls run one at a time.
+/// ```swift
+/// optimistic: { tx in
+///     let user = try tx.modelContext.fetch(descriptor).first
+///     user?.following = true
+///     tx.setQueryData(for: UserStats(id: id)) { $0.followers += 1 }
+///     return { _ in user?.following = false }
+/// }
+/// ```
+@MainActor
+public struct OptimisticContext {
+    /// The container's main context. Edit rows here and return a ``MutationRollback`` that
+    /// restores them.
+    public let modelContext: ModelContext
+    let provider: QueryProvider
+    let recorder: OptimisticRecorder
+
+    /// Updates a key's query data right away.
+    ///
+    /// The key's in-flight fetch is cancelled first, so an older response can't overwrite the
+    /// edit; a ``QueryProvider/query(_:staleTime:)-(F,_)`` waiting on that fetch returns the
+    /// optimistic data. Does nothing if the key has no data yet. If the mutation fails, the
+    /// previous data is restored, unless the key has changed since, such as by a fetch or a newer
+    /// optimistic update. Either way the key is invalidated when the mutation settles.
+    public func setQueryData<F: QueryFetcher>(
+        for fetcher: F,
+        _ update: @escaping @Sendable (inout F.QueryData) -> Void
+    ) {
+        let client = provider.client(for: fetcher)
+        guard let rollback = client.applyOptimistic(update) else { return }
+        recorder.rollbacks.append(rollback)
+        recorder.filters.append(.key(client))
+    }
+
+    /// ``setQueryData(for:_:)-(F,_)`` for a model collection.
+    public func setQueryData<M: QueryModel>(
+        for model: M.Type,
+        _ update: @escaping @Sendable (inout M.QueryData) -> Void
+    ) {
+        setQueryData(for: ModelFetcher<M>(), update)
+    }
+}
+
+/// Collects the query data changes an optimistic update makes.
+@MainActor
+final class OptimisticRecorder {
+    var rollbacks: [@MainActor () async -> Void] = []
+    var filters: [QueryFilter] = []
+}
+
+/// Shared bookkeeping for a set of mutations: how many are pending, which optimistic update is
+/// newest, and which keys to invalidate once none are pending.
+///
+/// Scoped mutations use one group per scope, shared across the provider, and their remote calls
+/// run one at a time. Unscoped mutations run in parallel; those started from the same
+/// ``QueryObserver`` share a group, so an older one that fails doesn't roll back over a newer one.
 @MainActor
 final class MutationGroup {
     /// Completes when the last queued mutation's remote call has finished. Scoped groups only.
@@ -10,12 +69,16 @@ final class MutationGroup {
     var pending = 0
     /// The newest optimistic mutation; an older one that fails skips its rollback.
     var latestOptimistic: UInt64 = 0
-    /// Refetches to run when `pending` reaches zero, keyed by client.
-    var refetches: [ObjectIdentifier: @MainActor () async -> Void] = [:]
+    /// Keys to invalidate when the scope drains. Scoped groups only.
+    var filters: Set<QueryFilter> = []
+    /// Whether a mutation in the scope skipped its rollback, so its keys must refetch even where
+    /// no view shows them. Scoped groups only.
+    var skippedRollback = false
+    /// Pending markers of the scope's optimistic mutations, deleted when the scope drains.
+    var markers: [String] = []
 }
 
-/// Orders scoped mutations. Owned by ``QueryProvider`` and shared by its clients,
-/// so a scope can span several models.
+/// Orders scoped mutations. Owned by ``QueryProvider``, so a scope spans every client.
 @MainActor
 final class MutationScheduler {
     private(set) var groups: [AnyHashable: MutationGroup] = [:]
@@ -54,5 +117,316 @@ final class MutationGate {
             waiter.resume()
         }
         waiters = []
+    }
+}
+
+/// A mutation whose optimistic update has been applied and whose place in its scope is taken,
+/// waiting to send its remote call.
+@MainActor
+final class MutationRun {
+    let group: MutationGroup
+    let scope: AnyHashable?
+    let filters: [QueryFilter]
+    let rollback: MutationRollback?
+    let dataRollbacks: [@MainActor () async -> Void]
+    let optimisticID: UInt64?
+    let previous: Task<Void, Never>?
+    let gate: MutationGate?
+    /// The key of the record marking this mutation as pending, if it has an optimistic update.
+    let marker: String?
+
+    init(
+        group: MutationGroup,
+        scope: AnyHashable?,
+        filters: [QueryFilter],
+        rollback: MutationRollback?,
+        dataRollbacks: [@MainActor () async -> Void],
+        optimisticID: UInt64?,
+        previous: Task<Void, Never>?,
+        gate: MutationGate?,
+        marker: String?
+    ) {
+        self.group = group
+        self.scope = scope
+        self.filters = filters
+        self.rollback = rollback
+        self.dataRollbacks = dataRollbacks
+        self.optimisticID = optimisticID
+        self.previous = previous
+        self.gate = gate
+        self.marker = marker
+    }
+}
+
+extension QueryProvider {
+    // MARK: Mutation engine
+
+    /// Applies the optimistic update and takes the mutation's place in its scope, synchronously,
+    /// so mutations started in a row keep their order and their edits show at once.
+    ///
+    /// - Parameter group: The group for an unscoped mutation; `nil` gives it a group of its own.
+    func beginMutation(
+        scope: (any Hashable & Sendable)?,
+        group unscoped: MutationGroup?,
+        invalidates: [QueryFilter],
+        optimistic: (@MainActor (OptimisticContext) throws -> MutationRollback?)?
+    ) throws -> MutationRun {
+        let scopeKey = scope.map { AnyHashable($0) }
+        let group = scopeKey.map { mutations.group(for: $0) } ?? unscoped ?? MutationGroup()
+        var filters = invalidates
+        var rollback: MutationRollback?
+        var dataRollbacks: [@MainActor () async -> Void] = []
+        var optimisticID: UInt64?
+
+        var marker: String?
+        if let optimistic {
+            let recorder = OptimisticRecorder()
+            var marked = false
+            do {
+                rollback = try Self.applyOptimistic({ context in
+                    try optimistic(OptimisticContext(modelContext: context, provider: self, recorder: recorder))
+                }, in: modelContainer.mainContext, save: { context in
+                    // Mark the mutation before its optimistic changes are saved, so an app
+                    // terminated before it settles refetches its keys at the next launch.
+                    if !marked {
+                        marked = true
+                        marker = markPendingMutation(filters + recorder.filters)
+                    }
+                    try Self.saveIfNeeded(context)
+                })
+            } catch {
+                let rollbacks = recorder.rollbacks
+                Task {
+                    for rollback in rollbacks { await rollback() }
+                }
+                releasePendingMutations([marker].compactMap { $0 })
+                if let scopeKey { mutations.release(scopeKey, group) }
+                throw error
+            }
+            dataRollbacks = recorder.rollbacks
+            filters += recorder.filters
+            group.latestOptimistic &+= 1
+            optimisticID = group.latestOptimistic
+        }
+
+        group.pending += 1
+        mutationCount += 1
+        if let scopeKey {
+            scopeMutationCounts[scopeKey, default: 0] += 1
+        }
+
+        // Scoped: wait for the previous mutation's remote call, and let the next one wait for ours.
+        var previous: Task<Void, Never>?
+        var gate: MutationGate?
+        if scopeKey != nil {
+            let ownGate = MutationGate()
+            previous = group.tail
+            let waitFor = previous
+            group.tail = Task {
+                await waitFor?.value
+                await ownGate.wait()
+            }
+            gate = ownGate
+        }
+
+        let run = MutationRun(
+            group: group,
+            scope: scopeKey,
+            filters: filters,
+            rollback: rollback,
+            dataRollbacks: dataRollbacks,
+            optimisticID: optimisticID,
+            previous: previous,
+            gate: gate,
+            marker: marker
+        )
+        if optimisticID != nil {
+            optimisticFilters[ObjectIdentifier(run)] = filters
+            holdCoveredClients()
+        }
+        return run
+    }
+
+    /// Sends the remote call once it's the mutation's turn, rolls back on failure, and settles.
+    func finishMutation<Result>(
+        _ run: MutationRun,
+        _ mutation: @escaping @Sendable () async throws -> sending Result
+    ) async throws -> Result {
+        defer {
+            mutationCount -= 1
+            if let scope = run.scope {
+                let count = scopeMutationCounts[scope, default: 1] - 1
+                scopeMutationCounts[scope] = count > 0 ? count : nil
+            }
+        }
+        await Self.waitForTurn(after: run.previous)
+
+        let result: Result
+        do {
+            try Task.checkCancellation()
+            result = try await Self.send(mutation)
+        } catch {
+            run.gate?.open()
+            run.group.pending -= 1
+            optimisticFilters[ObjectIdentifier(run)] = nil
+            var skippedRollback = false
+            if let rollback = run.rollback {
+                if run.optimisticID == run.group.latestOptimistic {
+                    let context = modelContainer.mainContext
+                    do {
+                        try rollback(context)
+                        try Self.saveIfNeeded(context)
+                    } catch {
+                        skippedRollback = true
+                    }
+                } else {
+                    // A newer optimistic edit may cover the same rows; the refetch below fixes
+                    // whatever this one left behind.
+                    skippedRollback = true
+                }
+            }
+            // Query data only restores while it still holds this update, so it never clobbers
+            // a newer one.
+            for rollback in run.dataRollbacks {
+                await rollback()
+            }
+            await settle(run, skippedRollback: skippedRollback)
+            throw error
+        }
+        run.gate?.open()
+        run.group.pending -= 1
+        optimisticFilters[ObjectIdentifier(run)] = nil
+        await settle(run, skippedRollback: false)
+        return result
+    }
+
+    /// Invalidates the mutation's keys, or for a scope, every key its mutations touched once
+    /// nothing in it is pending. After a skipped rollback, the keys refetch even where no view
+    /// shows them, so the edit it left behind is replaced by the server's data.
+    private func settle(_ run: MutationRun, skippedRollback: Bool) async {
+        guard let scope = run.scope else {
+            await invalidateAndRefetch(run.filters, everywhere: skippedRollback)
+            releasePendingMutations([run.marker].compactMap { $0 })
+            return
+        }
+        run.group.filters.formUnion(run.filters)
+        run.group.skippedRollback = run.group.skippedRollback || skippedRollback
+        run.group.markers += [run.marker].compactMap { $0 }
+        guard run.group.pending == 0 else { return }
+        let filters = Array(run.group.filters)
+        let everywhere = run.group.skippedRollback
+        let markers = run.group.markers
+        run.group.filters = []
+        run.group.skippedRollback = false
+        run.group.markers = []
+        mutations.release(scope, run.group)
+        await invalidateAndRefetch(filters, everywhere: everywhere)
+        releasePendingMutations(markers)
+    }
+
+    /// Records an optimistic mutation's filters as pending, and returns the marker's key. One small
+    /// record per mutation, however many keys the filters match. Uses its own context, so the
+    /// main context's other changes aren't saved with it.
+    private func markPendingMutation(_ filters: [QueryFilter]) -> String? {
+        guard !filters.isEmpty, let data = try? JSONEncoder().encode(filters) else { return nil }
+        let context = bookkeepingContext()
+        let key = QueryRecord.Key.marker()
+        context.insert(QueryRecord(key: key, stateData: data))
+        guard (try? context.save()) != nil else { return nil }
+        return key
+    }
+
+    /// Deletes pending markers once their mutations have settled and their keys are invalidated.
+    private func releasePendingMutations(_ markers: [String]) {
+        guard !markers.isEmpty else { return }
+        let context = bookkeepingContext()
+        for marker in markers {
+            for record in (try? context.fetch(QueryRecord.descriptor(key: marker))) ?? [] {
+                context.delete(record)
+            }
+        }
+        try? context.save()
+    }
+
+    /// Invalidates the keys of mutations that never settled because the app was terminated, then
+    /// deletes their markers. Runs at launch, before any client loads its state.
+    func recoverPendingMutations() {
+        let context = bookkeepingContext()
+        let prefix = QueryRecord.Key.markerPrefix
+        let markers = (try? context.fetch(FetchDescriptor<QueryRecord>(
+            predicate: #Predicate { $0.key.starts(with: prefix) }
+        ))) ?? []
+        guard !markers.isEmpty else { return }
+        var filters: [QueryFilter] = []
+        for marker in markers {
+            if let data = marker.stateData, let decoded = try? JSONDecoder().decode([QueryFilter].self, from: data) {
+                filters += decoded
+            }
+            context.delete(marker)
+        }
+        for record in storedRecords(matching: filters, in: context) {
+            record.invalidated = true
+        }
+        try? context.save()
+    }
+
+    /// Runs the remote call in its own task, so it outlives a cancelled caller.
+    private static func send<Value>(
+        _ mutation: @escaping @Sendable () async throws -> sending Value
+    ) async throws -> Value {
+        try await withCheckedThrowingContinuation { continuation in
+            Task {
+                do {
+                    continuation.resume(returning: try await mutation())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Waits for the previous mutation in a scope, returning early if the caller is cancelled.
+    /// Leaving early never reorders the queue: the next mutation still waits for `previous`.
+    private static func waitForTurn(after previous: Task<Void, Never>?) async {
+        guard let previous else { return }
+        let turn = MutationGate()
+        Task {
+            await previous.value
+            turn.open()
+        }
+        await withTaskCancellationHandler {
+            await turn.wait()
+        } onCancel: {
+            Task { @MainActor in turn.open() }
+        }
+    }
+
+    /// Applies an optimistic update and saves it. If the save fails, the update's own rollback
+    /// runs before the error is rethrown, so a mutation that never ran leaves nothing behind.
+    static func applyOptimistic(
+        _ optimistic: @MainActor (ModelContext) throws -> MutationRollback?,
+        in context: ModelContext,
+        save: @MainActor (ModelContext) throws -> Void = saveIfNeeded
+    ) throws -> MutationRollback? {
+        let rollback = try optimistic(context)
+        do {
+            try save(context)
+        } catch {
+            if let rollback {
+                try? rollback(context)
+                try? save(context)
+            }
+            throw error
+        }
+        return rollback
+    }
+
+    /// Saves the main context after an optimistic update or rollback, but only when it autosaves.
+    /// Saving commits every pending change in the shared context, so an app that turned autosave
+    /// off (to hold drafts, for example) keeps control and its closures must save themselves.
+    static func saveIfNeeded(_ context: ModelContext) throws {
+        if context.autosaveEnabled, context.hasChanges {
+            try context.save()
+        }
     }
 }

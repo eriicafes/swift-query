@@ -22,6 +22,10 @@ import SwiftData
 /// - `fetchers:` lists every persisted model and fetcher type, so the provider can evict their
 ///   expired caches even when no client exists. Fetchers whose `cache` is `nil` need not be
 ///   listed. The list doesn't restrict which keys can be used.
+/// - `recoversInterruptedMutations` invalidates, at launch, the keys of optimistic mutations that
+///   never settled because the app was terminated. Pass `false` for a provider that shares its
+///   store with another one running at the same time, such as in an app extension, so it doesn't
+///   mistake the app's mutations in progress for interrupted ones.
 @Observable
 @MainActor
 public final class QueryProvider {
@@ -32,18 +36,26 @@ public final class QueryProvider {
     public let keepAliveTime: Duration
     /// Orders scoped mutations across every client.
     @ObservationIgnored let mutations = MutationScheduler()
+    /// How many mutations are running or queued.
+    var mutationCount = 0
+    /// How many mutations are running or queued per scope.
+    var scopeMutationCounts: [AnyHashable: Int] = [:]
+    /// The filters of optimistic mutations whose remote call hasn't returned, by mutation. Keys
+    /// they match are held: syncs don't fetch them, and settling defers their refetch.
+    @ObservationIgnored var optimisticFilters: [ObjectIdentifier: [QueryFilter]] = [:]
     @ObservationIgnored private var contexts: [ObjectIdentifier: Any] = [:]
     @ObservationIgnored private(set) var entries: [String: FetcherEntry] = [:]
     /// Every live client, held weakly so a client someone still holds is reused, never duplicated.
     @ObservationIgnored private var clients: [AnyHashable: WeakClient] = [:]
     /// Clients kept alive by the provider: models, clients in use, and idle ones in their keep-alive time.
-    @ObservationIgnored private var retained: [AnyHashable: any AnyModelQueryClient] = [:]
+    @ObservationIgnored private var retained: [AnyHashable: any AnyQueryObserver] = [:]
 
     public init<each Context: Sendable>(
         modelContainer: ModelContainer,
         contexts: repeat each Context,
         fetchers: any Queryable.Type...,
-        keepAliveTime: Duration = .seconds(5 * 60)
+        keepAliveTime: Duration = .seconds(5 * 60),
+        recoversInterruptedMutations: Bool = true
     ) {
         precondition(
             modelContainer.schema.entities.contains { $0.name == String(describing: QueryRecord.self) },
@@ -60,6 +72,10 @@ public final class QueryProvider {
         // Fail at launch, not on first use, when a listed type's context is missing.
         for entry in entries.values {
             entry.validate(self)
+        }
+        // Refetch keys whose optimistic changes were saved by mutations that never settled.
+        if recoversInterruptedMutations {
+            recoverPendingMutations()
         }
         // Clean up data that expired since the last launch.
         scheduleGarbageCollection()
@@ -92,9 +108,9 @@ public final class QueryProvider {
     // MARK: Clients
 
     /// The shared client for a fetcher key, created on first use.
-    public func client<F: QueryFetcher>(for fetcher: F) -> ModelQueryClient<F> {
+    public func client<F: QueryFetcher>(for fetcher: F) -> QueryObserver<F> {
         let id = AnyHashable(fetcher)
-        if let existing = clients[id]?.client as? ModelQueryClient<F> {
+        if let existing = clients[id]?.client as? QueryObserver<F> {
             return existing
         }
         let key = QueryRecord.Key.make(fetcher)
@@ -103,12 +119,12 @@ public final class QueryProvider {
                 "`\(QueryRecord.Key.typeName(of: key))` is persisted but not listed in `fetchers:`, so its expired cache is never evicted"
             )
         }
-        let client = ModelQueryClient(
+        let client = QueryObserver(
             fetcher: fetcher,
             recordKey: key,
             modelContainer: modelContainer,
             fetchContext: fetchContext(F.Context.self),
-            scheduler: mutations,
+            provider: self,
             onEvict: { [weak self] tags, key in
                 await self?.invalidateShared(tags: tags, except: key)
             }
@@ -119,6 +135,9 @@ public final class QueryProvider {
         }
         clients[id] = WeakClient(client)
         retained[id] = client
+        if isCovered(client) {
+            client.hold()
+        }
         if !client.isModel {
             scheduleRelease(id, client)
         }
@@ -126,11 +145,11 @@ public final class QueryProvider {
     }
 
     /// The shared client for a model collection.
-    public func client<M: QueryModel>(for model: M.Type) -> ModelQueryClient<ModelFetcher<M>> {
+    public func client<M: QueryModel>(for model: M.Type) -> QueryObserver<ModelFetcher<M>> {
         client(for: ModelFetcher<M>())
     }
 
-    private func activityChanged(_ id: AnyHashable, _ client: any AnyModelQueryClient) {
+    private func activityChanged(_ id: AnyHashable, _ client: any AnyQueryObserver) {
         if client.isActive {
             retained[id] = client
             client.idleGeneration &+= 1
@@ -142,7 +161,7 @@ public final class QueryProvider {
     /// Keeps an idle client for the keep-alive time. If it isn't used again, a fetcher client is
     /// let go (cancelling its subscription task when it deallocates) and a model client's
     /// subscription task is cancelled.
-    private func scheduleRelease(_ id: AnyHashable, _ client: any AnyModelQueryClient) {
+    private func scheduleRelease(_ id: AnyHashable, _ client: any AnyQueryObserver) {
         retained[id] = client
         client.idleGeneration &+= 1
         let generation = client.idleGeneration
@@ -186,8 +205,8 @@ public final class QueryProvider {
     }
 
     /// Every client still alive, whether retained or held elsewhere.
-    var liveClients: [any AnyModelQueryClient] {
-        clients.values.compactMap { $0.client as? any AnyModelQueryClient }
+    var liveClients: [any AnyQueryObserver] {
+        clients.values.compactMap { $0.client as? any AnyQueryObserver }
     }
 
     // MARK: Reading and writing state
@@ -195,11 +214,11 @@ public final class QueryProvider {
     /// The current status of a key, without creating a client or fetching. Uses the live client
     /// if there is one (observable in views), otherwise the stored state (a snapshot).
     public func getQueryState<F: QueryFetcher>(for fetcher: F) -> QueryState<F.QueryData> {
-        if let live = clients[AnyHashable(fetcher)]?.client as? ModelQueryClient<F> {
+        if let live = clients[AnyHashable(fetcher)]?.client as? QueryObserver<F> {
             return live.state
         }
         guard fetcher.cache != nil,
-              let (value, _, stale) = ModelQueryClient<F>.storedState(
+              let (value, _, stale) = QueryObserver<F>.storedState(
                 fetcher, key: QueryRecord.Key.make(fetcher), in: modelContainer.mainContext
               )
         else { return .pending }
@@ -260,53 +279,130 @@ public final class QueryProvider {
         try await setQueryData(for: ModelFetcher<M>(), data)
     }
 
+    // MARK: Mutations
+
+    /// Runs a remote mutation, optionally applying an optimistic update first, then invalidates
+    /// the keys it affects.
+    ///
+    /// ```swift
+    /// try await provider.mutate(scope: "user-\(id)", invalidates: [.tag("users")]) {
+    ///     try await api.follow(id)
+    /// } optimistic: { tx in
+    ///     tx.setQueryData(for: UserStats(id: id)) { $0.followers += 1 }
+    ///     return nil
+    /// }
+    /// ```
+    ///
+    /// - The optimistic update applies immediately. Rows are edited on the main context, which is
+    ///   then saved so a later refetch can't be overwritten by an unsaved edit; rollbacks are saved
+    ///   the same way. If that save fails, the update is rolled back and the error is rethrown
+    ///   before anything is sent. With `autosaveEnabled` off, nothing is saved for you: save in
+    ///   your closures.
+    /// - The remote call runs in its own task, so cancelling the caller doesn't cancel a call that
+    ///   was already sent; the caller still gets its result. A caller cancelled before its call is
+    ///   sent rolls back and throws `CancellationError`.
+    /// - On failure, the rollback runs and query data changed with
+    ///   ``OptimisticContext/setQueryData(for:_:)-(F,_)`` is restored, then the error is
+    ///   rethrown. Query data is only restored if nothing has changed it since. The rollback is
+    ///   skipped if a newer optimistic mutation has started since in the same scope, or, without
+    ///   a scope, from the same ``QueryObserver``, so it can't clobber the newer change; the
+    ///   mutation's keys that have a client then refetch even where no view shows them.
+    /// - Whether it succeeds or fails, the mutation settles by invalidating the keys matching
+    ///   `invalidates`, plus any key whose query data the optimistic update changed. Keys shown
+    ///   in a view refetch with a request sent after the mutation, and `mutate` waits for them; a
+    ///   failed refetch is reported by its client and doesn't make `mutate` throw. Other keys
+    ///   fetch on their next sync.
+    ///
+    /// Mutation failures never change a key's state to `.error`.
+    ///
+    /// Before optimistic changes are saved, the mutation's filters are stored as pending. If the
+    /// app is terminated before it settles, the keys they match are invalidated at the next
+    /// launch, so optimistic data the server never confirmed is refetched. A provider that shares
+    /// its store with another one running at the same time, such as in an app extension, should
+    /// pass `recoversInterruptedMutations: false`.
+    ///
+    /// While an optimistic mutation's remote call is in flight, the keys its filters match are
+    /// held: syncs from views don't fetch them if they have data, and when another mutation
+    /// settles, their refetch waits until no in-flight optimistic mutation covers them. So the
+    /// server's older data can't overwrite the edit. ``QueryObserver/refresh()`` and
+    /// ``query(_:staleTime:)-(F,_)`` still fetch.
+    ///
+    /// ### Scopes
+    ///
+    /// Mutations with the same `scope` send their remote calls one at a time, in call order,
+    /// whether they are started from the provider, a ``QueryObserver``, or a
+    /// ``MutationClient``. Mutations without a scope run in parallel. A per-record scope such as
+    /// `"user-\(id)"` is typical; always use the same scope (or always none) for a given record.
+    ///
+    /// Within a scope, optimistic updates still apply immediately, a failure doesn't cancel later
+    /// mutations, and each error goes only to its own caller. The scope settles once it has
+    /// nothing left queued, invalidating the keys of every mutation in it at once, and only the
+    /// caller of the last mutation waits for it. A caller cancelled while queued stops waiting
+    /// right away, rolls back, and throws `CancellationError` without sending its remote call;
+    /// later mutations keep their order.
+    @discardableResult
+    public func mutate<Result>(
+        scope: (any Hashable & Sendable)? = nil,
+        invalidates: [QueryFilter] = [],
+        _ mutation: @escaping @Sendable () async throws -> sending Result,
+        optimistic: (@MainActor (OptimisticContext) throws -> MutationRollback?)? = nil
+    ) async throws -> Result {
+        let run = try beginMutation(scope: scope, group: nil, invalidates: invalidates, optimistic: optimistic)
+        return try await finishMutation(run, mutation)
+    }
+
+    /// Whether any mutation is queued, running, or waiting for its keys to refetch. In a scope,
+    /// only the last mutation waits for the refetch.
+    public var isMutating: Bool { mutationCount > 0 }
+
+    /// Whether a mutation in `scope` is queued, running, or waiting for the scope's keys to
+    /// refetch.
+    public func isMutating(scope: any Hashable & Sendable) -> Bool {
+        scopeMutationCounts[AnyHashable(scope), default: 0] > 0
+    }
+
     // MARK: Bulk operations
 
-    /// Marks a key's cache as stale. Clients shown in a view re-sync right away; other keys
-    /// fetch on their next sync. Existing data stays available.
-    public func invalidate<F: QueryFetcher>(_ fetcher: F) { invalidate(.key(QueryRecord.Key.make(fetcher))) }
-    /// Invalidates every key of a fetcher type, or a model collection.
-    public func invalidate(_ type: any Queryable.Type) { invalidate(.type(String(reflecting: type))) }
-    /// Invalidates every key tagged `tag`.
-    public func invalidate(tag: String) { invalidate(.tag(tag)) }
-
-    /// Fetches matching keys that have a live client. With `includeStored`, also fetches stored
-    /// keys of listed types that have no client.
+    /// Marks matching keys as stale. Keys shown in a view refetch right away; other keys fetch on
+    /// their next sync. Existing data stays available. A key an optimistic mutation in flight
+    /// covers refetches once that mutation settles instead, so its edit isn't overwritten.
     ///
-    /// Only existing keys are refetched: a key that was never fetched, or an in-memory key whose
-    /// client was dropped, has neither a client nor a stored record, so nothing happens. To fetch
-    /// any key unconditionally, use ``query(_:staleTime:)-(F,_)`` with `staleTime: .after(.zero)`.
-    public func refetch<F: QueryFetcher>(_ fetcher: F) async { await refetch(.key(QueryRecord.Key.make(fetcher)), includeStored: true) }
-    /// Refetches every key of a fetcher type, or a model collection.
-    public func refetch(_ type: any Queryable.Type, includeStored: Bool = false) async {
-        await refetch(.type(String(reflecting: type)), includeStored: includeStored)
-    }
-    /// Refetches every key tagged `tag`.
-    public func refetch(tag: String, includeStored: Bool = false) async {
-        await refetch(.tag(tag), includeStored: includeStored)
+    /// ```swift
+    /// provider.invalidate(.tag("users"), .type(UserStats.self))
+    /// ```
+    public func invalidate(_ filters: QueryFilter...) {
+        invalidate(filters)
     }
 
-    /// Cancels in-flight fetches. Rows already saved stay and states keep their previous value.
-    public func cancel<F: QueryFetcher>(_ fetcher: F) { cancel(.key(QueryRecord.Key.make(fetcher))) }
-    /// Cancels in-flight fetches of every key of a fetcher type, or a model collection.
-    public func cancel(_ type: any Queryable.Type) { cancel(.type(String(reflecting: type))) }
-    /// Cancels in-flight fetches of every key tagged `tag`.
-    public func cancel(tag: String) { cancel(.tag(tag)) }
+    /// Fetches matching keys, joining fetches already in flight.
+    ///
+    /// `type` picks which keys: `.active` (the default) refetches keys shown in a view;
+    /// `.inactive` refetches every other key the provider knows about, including stored keys of
+    /// listed types that have no client; `.all` refetches both. A key that was never fetched has
+    /// nothing to refetch. To fetch any key unconditionally, use ``query(_:staleTime:)-(F,_)``
+    /// with `staleTime: .after(.zero)`.
+    public func refetch(_ filters: QueryFilter..., type: QueryType = .active) async {
+        await refetch(filters, type: type)
+    }
 
-    /// Drops cached state: evicts the key's rows, deletes its stored state, and returns live
-    /// clients to `.pending`. Keys sharing a tag with a removed key are invalidated.
-    public func remove<F: QueryFetcher>(_ fetcher: F) async { await remove(.key(QueryRecord.Key.make(fetcher)), refetchObserved: false) }
-    /// Removes every key of a fetcher type, or a model collection.
-    public func remove(_ type: any Queryable.Type) async { await remove(.type(String(reflecting: type)), refetchObserved: false) }
-    /// Removes every key tagged `tag`.
-    public func remove(tag: String) async { await remove(.tag(tag), refetchObserved: false) }
+    /// Cancels in-flight fetches of matching keys. Rows already saved stay and states keep their
+    /// previous value.
+    public func cancel(_ filters: QueryFilter...) {
+        for client in liveClients(matching: filters) {
+            client.cancel()
+        }
+    }
+
+    /// Drops cached state: evicts matching keys' rows, deletes their stored state, and returns
+    /// live clients to `.pending`. Keys sharing a tag with a removed key are invalidated.
+    public func remove(_ filters: QueryFilter...) async {
+        await remove(filters, refetchObserved: false)
+    }
 
     /// Removes matching keys, then syncs the ones a view still shows.
-    public func reset<F: QueryFetcher>(_ fetcher: F) async { await remove(.key(QueryRecord.Key.make(fetcher)), refetchObserved: true) }
-    /// Resets every key of a fetcher type, or a model collection.
-    public func reset(_ type: any Queryable.Type) async { await remove(.type(String(reflecting: type)), refetchObserved: true) }
-    /// Resets every key tagged `tag`.
-    public func reset(tag: String) async { await remove(.tag(tag), refetchObserved: true) }
+    public func reset(_ filters: QueryFilter...) async {
+        await remove(filters, refetchObserved: true)
+    }
 
     /// Evicts expired SWR caches of live clients that are unobserved and idle, and of every
     /// stored key without a client, using each record's stored cache time. Records of types no
@@ -329,60 +425,50 @@ public final class QueryProvider {
         }
     }
 
-    // MARK: Selectors
+    // MARK: Matching
 
-    enum Selector {
-        case key(String)
-        case type(String)
-        case tag(String)
-
-        func matches(key: String, tags: Set<String>) -> Bool {
-            switch self {
-            case .key(let match): key == match
-            case .type(let name): key == name || key.hasPrefix(name + ":")
-            case .tag(let tag): tags.contains(tag)
-            }
-        }
-
-        func descriptor() -> FetchDescriptor<QueryRecord> {
-            switch self {
-            case .key(let key):
-                return FetchDescriptor(predicate: #Predicate { $0.key == key })
-            case .type(let name):
-                let prefix = name + ":"
-                return FetchDescriptor(predicate: #Predicate { $0.key == name || $0.key.starts(with: prefix) })
-            case .tag(let tag):
-                let needle = QueryRecord.Tags.needle(tag)
-                return FetchDescriptor(predicate: #Predicate { $0.tags.contains(needle) })
-            }
+    /// Live clients matching any of `filters`, each once.
+    private func liveClients(matching filters: [QueryFilter]) -> [any AnyQueryObserver] {
+        liveClients.filter { client in
+            filters.contains { $0.matches(key: client.recordKey, tags: client.tagSet) }
         }
     }
 
-    private func liveClients(matching selector: Selector) -> [any AnyModelQueryClient] {
-        liveClients.filter { selector.matches(key: $0.recordKey, tags: $0.tagSet) }
-    }
-
-    private func storedRecords(matching selector: Selector, in context: ModelContext) -> [QueryRecord] {
+    /// Stored records without a live client matching any of `filters`, each once. Pending
+    /// mutation markers never match.
+    func storedRecords(matching filters: [QueryFilter], in context: ModelContext) -> [QueryRecord] {
         let liveKeys = Set(liveClients.map(\.recordKey))
-        let records = (try? context.fetch(selector.descriptor())) ?? []
-        return records.filter { !liveKeys.contains($0.key) }
+        var seen = Set<String>()
+        var records: [QueryRecord] = []
+        for filter in filters {
+            for record in (try? context.fetch(filter.descriptor())) ?? []
+            where !liveKeys.contains(record.key) && !QueryRecord.Key.isMarker(record.key)
+                && seen.insert(record.key).inserted {
+                records.append(record)
+            }
+        }
+        return records
     }
 
-    private func bookkeepingContext() -> ModelContext {
+    func bookkeepingContext() -> ModelContext {
         let context = ModelContext(modelContainer)
         context.autosaveEnabled = false
         return context
     }
 
-    private func invalidate(_ selector: Selector, except excluded: String? = nil) {
-        for client in liveClients(matching: selector) where client.recordKey != excluded {
+    private func invalidate(_ filters: [QueryFilter], except excluded: String? = nil) {
+        for client in liveClients(matching: filters) where client.recordKey != excluded {
             client.invalidate()
             if client.isObserved {
                 client.resync()
             }
         }
+        markStoredInvalidated(filters, except: excluded)
+    }
+
+    private func markStoredInvalidated(_ filters: [QueryFilter], except excluded: String? = nil) {
         let context = bookkeepingContext()
-        for record in storedRecords(matching: selector, in: context) where record.key != excluded {
+        for record in storedRecords(matching: filters, in: context) where record.key != excluded {
             record.invalidated = true
         }
         try? context.save()
@@ -390,17 +476,75 @@ public final class QueryProvider {
 
     /// Invalidates other keys that share a tag with an evicted or removed key.
     func invalidateShared(tags: Set<String>, except key: String) {
-        for tag in tags {
-            invalidate(.tag(tag), except: key)
+        invalidate(tags.map { .tag($0) }, except: key)
+    }
+
+    /// Whether an optimistic mutation whose remote call hasn't returned covers the client's key.
+    func isCovered(_ client: any AnyQueryObserver) -> Bool {
+        optimisticFilters.values.contains { filters in
+            filters.contains { $0.matches(key: client.recordKey, tags: client.tagSet) }
         }
     }
 
-    private func refetch(_ selector: Selector, includeStored: Bool) async {
-        var refreshes: [@MainActor () async -> Void] = liveClients(matching: selector).map { client in
-            { await client.refresh() }
+    /// Holds every live client an in-flight optimistic mutation covers.
+    func holdCoveredClients() {
+        for client in liveClients where !client.isHeld && isCovered(client) {
+            client.hold()
         }
-        if includeStored {
-            for record in storedRecords(matching: selector, in: bookkeepingContext()) {
+    }
+
+    /// Invalidates matching keys once a mutation settles, and waits for the keys shown in a view
+    /// to refetch with requests sent after the mutation. With `everywhere`, live clients no view
+    /// shows refetch too. Stored keys without a client never refetch here: they are marked
+    /// invalidated and fetch when next used, so a broad filter can't start a fetch for every key
+    /// ever cached.
+    ///
+    /// A key another in-flight optimistic mutation still covers doesn't refetch yet, so the
+    /// server's older data can't overwrite that mutation's edit; it refetches when the last
+    /// mutation covering it settles. Holds no mutation covers any more end here, and keys a sync
+    /// wanted to fetch meanwhile refetch.
+    func invalidateAndRefetch(_ filters: [QueryFilter], everywhere: Bool = false) async {
+        let clients = filters.isEmpty ? [] : liveClients(matching: filters)
+        for client in clients {
+            client.invalidate()
+        }
+        if !filters.isEmpty {
+            markStoredInvalidated(filters)
+        }
+        var targets: [any AnyQueryObserver] = []
+        for client in clients where everywhere || client.isObserved {
+            if isCovered(client) {
+                client.deferFetch()
+            } else {
+                targets.append(client)
+            }
+        }
+        let targetKeys = Set(targets.map(\.recordKey))
+        for client in liveClients where client.isHeld && !isCovered(client) {
+            if await client.release(), !targetKeys.contains(client.recordKey) {
+                targets.append(client)
+            }
+        }
+        let refetches: [@MainActor () async -> Void] = targets.map { client in
+            { await client.refetch() }
+        }
+        await withTaskGroup(of: Void.self) { group in
+            for refetch in refetches {
+                group.addTask { await refetch() }
+            }
+        }
+        // The invalidations are saved once each client's queued operations have run.
+        for client in clients {
+            await client.settleOperations()
+        }
+    }
+
+    private func refetch(_ filters: [QueryFilter], type: QueryType) async {
+        var refreshes: [@MainActor () async -> Void] = liveClients(matching: filters)
+            .filter { type.includes(observed: $0.isObserved) }
+            .map { client in { await client.refresh() } }
+        if type.includes(observed: false) {
+            for record in storedRecords(matching: filters, in: bookkeepingContext()) {
                 guard let entry = entries[QueryRecord.Key.typeName(of: record.key)] else { continue }
                 let key = record.key
                 refreshes.append { await entry.refresh(key, self) }
@@ -413,14 +557,8 @@ public final class QueryProvider {
         }
     }
 
-    private func cancel(_ selector: Selector) {
-        for client in liveClients(matching: selector) {
-            client.cancel()
-        }
-    }
-
-    private func remove(_ selector: Selector, refetchObserved: Bool) async {
-        for client in liveClients(matching: selector) {
+    private func remove(_ filters: [QueryFilter], refetchObserved: Bool) async {
+        for client in liveClients(matching: filters) {
             if refetchObserved {
                 await client.reset()
             } else {
@@ -428,7 +566,7 @@ public final class QueryProvider {
             }
         }
         let context = bookkeepingContext()
-        for record in storedRecords(matching: selector, in: context) {
+        for record in storedRecords(matching: filters, in: context) {
             await evictStored(record, in: context)
         }
     }
@@ -504,5 +642,93 @@ final class WeakClient {
 
     init(_ client: AnyObject) {
         self.client = client
+    }
+}
+
+/// Selects keys for bulk operations and for the keys a mutation invalidates.
+///
+/// ```swift
+/// .key(UserDetail(id: id))   // one fetcher key
+/// .key(postsClient)          // a client's key
+/// .type(User.self)           // a model's collection, or every key of a fetcher type
+/// .tag("users")              // every key tagged "users"
+/// .all                       // every key
+/// ```
+public struct QueryFilter: Hashable, Sendable, Codable {
+    enum Selector: Hashable, Sendable, Codable {
+        case key(String)
+        case type(String)
+        case tag(String)
+        case all
+    }
+
+    let selector: Selector
+
+    /// One fetcher key.
+    public static func key<F: QueryFetcher>(_ fetcher: F) -> QueryFilter {
+        QueryFilter(selector: .key(QueryRecord.Key.make(fetcher)))
+    }
+
+    /// The key a client syncs.
+    @MainActor
+    public static func key<F>(_ client: QueryObserver<F>) -> QueryFilter {
+        QueryFilter(selector: .key(client.recordKey))
+    }
+
+    /// A model's collection, or every key of a fetcher type.
+    public static func type(_ type: any Queryable.Type) -> QueryFilter {
+        QueryFilter(selector: .type(String(reflecting: type)))
+    }
+
+    /// Every key whose `tags` contain `tag`.
+    public static func tag(_ tag: String) -> QueryFilter {
+        QueryFilter(selector: .tag(tag))
+    }
+
+    /// Every key.
+    public static var all: QueryFilter {
+        QueryFilter(selector: .all)
+    }
+
+    func matches(key: String, tags: Set<String>) -> Bool {
+        switch selector {
+        case .key(let match): key == match
+        case .type(let name): key == name || key.hasPrefix(name + ":")
+        case .tag(let tag): tags.contains(tag)
+        case .all: true
+        }
+    }
+
+    func descriptor() -> FetchDescriptor<QueryRecord> {
+        switch selector {
+        case .key(let key):
+            return FetchDescriptor(predicate: #Predicate { $0.key == key })
+        case .type(let name):
+            let prefix = name + ":"
+            return FetchDescriptor(predicate: #Predicate { $0.key == name || $0.key.starts(with: prefix) })
+        case .tag(let tag):
+            let needle = QueryRecord.Tags.needle(tag)
+            return FetchDescriptor(predicate: #Predicate { $0.tags.contains(needle) })
+        case .all:
+            return FetchDescriptor()
+        }
+    }
+}
+
+/// Which matching keys ``QueryProvider/refetch(_:type:)`` fetches.
+public enum QueryType: Sendable {
+    /// Keys shown in a view.
+    case active
+    /// Every other key: live clients no view shows, and stored keys without a client.
+    case inactive
+    /// Both.
+    case all
+
+    func includes(observed: Bool) -> Bool {
+        switch self {
+        case .active: observed
+        case .inactive: !observed
+        case .all: true
+        }
     }
 }

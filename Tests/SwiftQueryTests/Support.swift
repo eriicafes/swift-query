@@ -140,7 +140,7 @@ func makeContainer() throws -> ModelContainer {
     )
 }
 
-typealias UsersClient = ModelQueryClient<ModelFetcher<TestUser>>
+typealias UsersClient = QueryObserver<ModelFetcher<TestUser>>
 
 @MainActor
 func makeProvider(

@@ -89,6 +89,19 @@ extension QueryRecord {
             return "\(String(reflecting: F.self)):\(String(decoding: data, as: UTF8.self))"
         }
 
+        /// The prefix of a pending mutation marker's key. `#` can't start a type name, so no
+        /// listed type or filter matches it.
+        static let markerPrefix = "#pending:"
+
+        /// A new pending mutation marker's key.
+        static func marker() -> String {
+            markerPrefix + UUID().uuidString
+        }
+
+        static func isMarker(_ key: String) -> Bool {
+            key.hasPrefix(markerPrefix)
+        }
+
         static func typeName(of key: String) -> String {
             key.firstIndex(of: ":").map { String(key[..<$0]) } ?? key
         }

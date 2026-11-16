@@ -271,7 +271,7 @@ Use it in a view the same way. When the fetcher depends on the view's input, set
 
 ```swift
 struct UserView: View {
-    @QueryClient<UserDetail> private var detail: ModelQueryClient<UserDetail>
+    @QueryClient<UserDetail> private var detail: QueryObserver<UserDetail>
     @Query private var users: [User]
 
     init(id: String) {
@@ -421,16 +421,19 @@ Each of these also accepts a model type, such as `provider.getQueryState(for: Po
 
 ## Invalidating and Refreshing
 
-Invalidating marks data as stale. Views showing it fetch again right away, and other data is fetched the next time it's used.
+Invalidating marks data as stale. Views showing it fetch again right away, and other data is fetched the next time it's used. Data an optimistic mutation is still changing waits until that mutation finishes, so the change isn't overwritten.
 
-You can invalidate one client, one fetcher value, every value of a type, or everything with a tag:
+You pick which data with filters:
 
 ```swift
-client.invalidate()                          // the data behind this client
-provider.invalidate(UserDetail(id: "42"))    // one fetcher value
-provider.invalidate(UserDetail.self)         // every UserDetail
-provider.invalidate(Post.self)               // the Post collection
-provider.invalidate(tag: "users")            // everything tagged "users"
+client.invalidate()                                   // the data behind this client
+provider.invalidate(.key(UserDetail(id: "42")))       // one fetcher value
+provider.invalidate(.key(postsClient))                // the data behind a client
+provider.invalidate(.type(UserDetail.self))           // every UserDetail
+provider.invalidate(.type(Post.self))                 // the Post collection
+provider.invalidate(.tag("users"))                    // everything tagged "users"
+provider.invalidate(.all)                             // everything
+provider.invalidate(.tag("users"), .type(Post.self))  // several at once
 ```
 
 Tags group data that changes together. Give models and fetchers tags with `tags`:
@@ -445,15 +448,22 @@ struct UserDetail: QueryFetcher {
 }
 ```
 
-The provider's other operations take the same arguments: a fetcher value, a type, or `tag:`.
+The provider's other operations take the same filters:
 
 | Operation | What it does |
 |---|---|
 | `invalidate` | Marks data as stale; shown data is fetched again |
-| `refetch` | Fetches now, for data that has a client |
+| `refetch` | Fetches now |
 | `cancel` | Stops fetches in progress and keeps the previous data |
 | `remove` | Deletes the data, running `evict` |
 | `reset` | Removes the data, then fetches it again for views showing it |
+
+`refetch` fetches data shown in a view. Pass `type: .inactive` to fetch the rest instead, including data saved earlier that nothing has used yet, or `type: .all` for both:
+
+```swift
+await provider.refetch(.tag("users"))               // what's on screen
+await provider.refetch(.all, type: .all)            // everything, for example after signing in
+```
 
 A single client offers the same for its own data: `client.sync()` fetches if stale, `client.refresh()` always fetches, and `client.cancel()` stops a fetch in progress.
 
@@ -461,7 +471,7 @@ When data is removed, everything that shares a tag with it is invalidated, so de
 
 ## Mutations
 
-A mutation changes data on the server. `mutate` runs your request, then fetches the client's data again so it matches the server:
+A mutation changes data on the server. Run it from the client whose data it changes, and that data is fetched again afterwards so it matches the server:
 
 ```swift
 try await postsClient.mutate {
@@ -469,13 +479,25 @@ try await postsClient.mutate {
 }
 ```
 
-To update the screen before the server responds, pass an `optimistic` closure. It changes SwiftData right away and returns a closure that undoes the change if the request fails:
+If the change affects other data too, list it in `invalidates`. It takes the same filters as `invalidate`:
+
+```swift
+try await postClient.mutate(invalidates: [.tag("users")]) {
+    try await api.like(postID: id)
+}
+```
+
+When the mutation finishes, whether it succeeded or failed, that data is invalidated. Data shown in a view is fetched again and `mutate` waits for it, so your view is up to date when `mutate` returns. Other data is fetched the next time it's used.
+
+### Optimistic updates
+
+To update the screen before the server responds, pass an `optimistic` closure. Change rows in `tx.modelContext` and return a closure that undoes the change if the request fails:
 
 ```swift
 try await postsClient.mutate {
     try await api.rename(postID: id, to: title)
-} optimistic: { context in
-    guard let post = try context.fetch(FetchDescriptor<Post>(predicate: #Predicate { $0.id == id })).first else {
+} optimistic: { tx in
+    guard let post = try tx.modelContext.fetch(FetchDescriptor<Post>(predicate: #Predicate { $0.id == id })).first else {
         return nil
     }
     let previous = post.title
@@ -484,10 +506,25 @@ try await postsClient.mutate {
 }
 ```
 
-- If the request succeeds, the change stays and the data is fetched again.
-- If it fails, the undo closure runs and the error is thrown to you.
-- A mutation refetches only its own client's data. If it affects other data, invalidate that too, for example `provider.invalidate(tag: "users")`.
+Query data, such as a count from a fetcher, is updated with `tx.setQueryData`. You don't write an undo for it; SwiftQuery puts the previous value back if the request fails:
+
+```swift
+try await profileClient.mutate {
+    try await api.follow(userID: id)
+} optimistic: { tx in
+    tx.setQueryData(for: FollowerCount(userID: id)) { $0 += 1 }
+    return nil
+}
+```
+
+- If the request succeeds, the changes stay until the data is fetched again.
+- If it fails, the undo closure runs, query data is put back, and the error is thrown to you. Query data is only put back if nothing, such as a fetch, has changed it since. If a newer optimistic mutation in the same scope, or from the same client, has started since, the undo closure is skipped so it can't undo the newer change, and the data is fetched again instead.
+- `setQueryData` stops a fetch of that data in progress, so an older response can't overwrite the change, and the data is invalidated when the mutation finishes. A `provider.query` waiting on that fetch gets the updated value.
+- While the request is in flight, the data it invalidates isn't fetched by views or by other mutations finishing, so the server's older data can't overwrite the change. Pull-to-refresh and `provider.query` still fetch.
 - Once a request is sent, cancelling the task that called `mutate` doesn't cancel it.
+- If the app is quit before a mutation finishes, the data it would have invalidated is fetched again at the next launch, so an optimistic change the server never confirmed doesn't stay. If an app extension creates its own provider on the same store, pass `recoversInterruptedMutations: false` to it, so it doesn't mistake the app's mutations in progress for interrupted ones.
+
+### Scopes
 
 When several edits to the same thing can happen quickly, give them a `scope`. Mutations in the same scope reach the server one at a time, in the order they were made:
 
@@ -496,6 +533,81 @@ try await postsClient.mutate(scope: "post-\(id)") {
     try await api.rename(postID: id, to: title)
 }
 ```
+
+Their data is invalidated once, after the last one finishes.
+
+### Mutations in views
+
+`@MutationClient` runs mutations from a view and tracks the latest one, for a spinner or an error message:
+
+```swift
+struct FollowButton: View {
+    let userID: String
+    @MutationClient private var follow
+
+    var body: some View {
+        Button("Follow") {
+            follow.mutate(invalidates: [.key(FollowerCount(userID: userID))]) {
+                try await api.follow(userID: userID)
+            }
+        }
+        .disabled(follow.isPending)
+        if let error = follow.error {
+            Text(error.localizedDescription)
+        }
+    }
+}
+```
+
+Called from a button's action, `mutate` returns right away and reports failures through `error`. Called with `await`, it returns the result and throws instead. In async code, such as `.task`, Swift always picks the awaited form; to start one there without waiting, wrap it in a closure: `_ = { follow.mutate { ... } }()`.
+
+To keep the request's input and result, give the client their types. `variables` holds the latest input and `data` the latest result:
+
+```swift
+@MutationClient<String, Message> private var send
+
+send.mutate(text) { text in
+    try await api.send(text)
+} optimistic: { tx, text in
+    tx.modelContext.insert(Message(text: text, pending: true))
+    return nil
+}
+```
+
+Use `@MutationClient<Void, Message>` to keep only the result. `follow.reset()` clears the status, error, input and result.
+
+`status`, `isPending`, `error`, `variables` and `data` follow the latest call. `isMutating` stays `true` while any call made through the wrapper is still running.
+
+A `scope` and `invalidates` given to the wrapper apply to each of its mutations. A call's own `scope` replaces the wrapper's, and its `invalidates` are added to the wrapper's:
+
+```swift
+@MutationClient(scope: "settings", invalidates: [.tag("settings")]) private var save
+```
+
+### Mutations outside views
+
+Code outside views, or a mutation that doesn't belong to one client, can use the provider:
+
+```swift
+try await provider.mutate(scope: "user-\(id)", invalidates: [.tag("users")]) {
+    try await api.follow(userID: id)
+}
+```
+
+To track a mutation's status outside a view, for example in a view model, create a `MutationObserver`. It's what `@MutationClient` gives a view:
+
+```swift
+@Observable @MainActor
+final class ProfileModel {
+    let follow: MutationObserver<Void, Void>
+
+    init(provider: QueryProvider) {
+        follow = MutationObserver(provider: provider, invalidates: [.tag("users")])
+    }
+}
+```
+
+`provider.isMutating` tells you whether any mutation is running, for example before signing out, and `provider.isMutating(scope:)` whether one in a scope is. `client.isMutating` covers mutations started from that client.
 
 ## Subscribe
 

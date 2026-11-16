@@ -63,7 +63,7 @@ extension TestFeed: QueryModel {
     }
 }
 
-typealias FeedClient = ModelQueryClient<ModelFetcher<TestFeed>>
+typealias FeedClient = QueryObserver<ModelFetcher<TestFeed>>
 
 @MainActor
 @Suite("Query data writer")
