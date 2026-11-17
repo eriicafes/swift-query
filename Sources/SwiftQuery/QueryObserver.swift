@@ -38,6 +38,10 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
     @ObservationIgnored private var tail: Task<Void, Never>?
     @ObservationIgnored private var lastSequence: UInt64 = 0
     @ObservationIgnored private var stateData: Data?
+    /// Optimistic edits shown here that the actor hasn't stored yet.
+    @ObservationIgnored private var optimisticWrites = 0
+    /// The latest snapshot held back while an optimistic edit was on its way.
+    @ObservationIgnored private var heldSnapshot: QuerySnapshot?
     @ObservationIgnored let provider: QueryProvider
     @ObservationIgnored private var observerCount = 0
     private var mutationCount = 0
@@ -210,7 +214,13 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
             await previous?.value
             return await actor.applyOptimistic(update)
         }
-        tail = Task { _ = await write.value }
+        // Until the actor has stored the edit, snapshots it publishes still carry the old data;
+        // keep them from replacing the edit on screen.
+        optimisticWrites += 1
+        tail = Task { [weak self] in
+            _ = await write.value
+            self?.optimisticWriteFinished()
+        }
         return {
             guard let (previous, applied) = await write.value else { return }
             await actor.restore(previous, ifCurrent: applied)
@@ -330,7 +340,6 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
         return await actor.collectGarbage()
     }
 
-    /// Waits for scheduled operations and any in-flight fetch to finish.
     /// Waits for scheduled operations only, not for any fetch they started.
     func settleOperations() async {
         await tail?.value
@@ -360,7 +369,34 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
     func receive(_ snapshot: QuerySnapshot) {
         guard snapshot.sequence > lastSequence else { return }
         lastSequence = snapshot.sequence
-        switch snapshot.status {
+        // While an optimistic edit is on its way to the actor, a snapshot with other data
+        // predates it. Its state is applied once the edit is stored, if nothing newer came.
+        if optimisticWrites > 0, snapshot.status.data != stateData {
+            heldSnapshot = snapshot
+        } else {
+            heldSnapshot = nil
+            apply(snapshot.status)
+        }
+        if fetchStatus != snapshot.fetchStatus {
+            fetchStatus = snapshot.fetchStatus
+            activityChanged()
+        }
+        if snapshot.error != nil || error != nil {
+            error = snapshot.error
+        }
+    }
+
+    private func optimisticWriteFinished() {
+        optimisticWrites -= 1
+        guard optimisticWrites == 0, let held = heldSnapshot else { return }
+        heldSnapshot = nil
+        if held.sequence == lastSequence {
+            apply(held.status)
+        }
+    }
+
+    private func apply(_ status: QuerySnapshot.Status) {
+        switch status {
         case .pending:
             stateData = nil
             if !state.isPending {
@@ -378,13 +414,6 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
         case .error(let error):
             stateData = nil
             state = .error(error)
-        }
-        if fetchStatus != snapshot.fetchStatus {
-            fetchStatus = snapshot.fetchStatus
-            activityChanged()
-        }
-        if snapshot.error != nil || error != nil {
-            error = snapshot.error
         }
     }
 

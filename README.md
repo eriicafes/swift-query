@@ -525,7 +525,7 @@ try await profileClient.mutate {
 ```
 
 - If the request succeeds, the changes stay until the data is fetched again.
-- If it fails, the undo closures run (newest first), query data is put back, and the error is thrown to you. Query data is only put back if nothing, such as a fetch, has changed it since. If a newer optimistic mutation may have changed the same data since, the undo closures don't run now, so they can't undo the newer change. While the newer one's request is in flight, they wait for it: if it fails too, they run after its own; if it succeeds, they're dropped. Either way the data is fetched again. A newer mutation counts when it's in the same scope or invalidates overlapping data: the same key or type, or any tag or `.all`. A mutation that invalidates nothing only counts through its scope.
+- If it fails, the undo closures run (newest first), query data is put back, and the error is thrown to you. Query data is only put back if nothing, such as a fetch, has changed it since. If a newer optimistic mutation may have changed the same data since, the undo closures don't run now, so they can't undo the newer change. While the newer one's request is in flight, they wait for it: if it fails too, they run after its own; if it succeeds, they're dropped. Either way the data is fetched again. A newer mutation counts when it invalidates overlapping data: the same key or type, or any tag or `.all`. Sharing a scope doesn't count, so scoped mutations that change the same rows should list them in `invalidates`. A mutation that invalidates nothing never counts, and its undo closures always run.
 - `setQueryData` stops a fetch of that data in progress, so an older response can't overwrite the change, and the data is invalidated when the mutation finishes. A `provider.query` waiting on that fetch gets the updated value.
 - While the request is in flight, the data it invalidates isn't fetched by views or by other mutations finishing, so the server's older data can't overwrite the change. Pull-to-refresh and `provider.query` still fetch.
 - Once a request is sent, cancelling the task that called `mutate` doesn't cancel it.
@@ -662,7 +662,7 @@ let applied = try await writer.write(.now) { tx in
 if !applied { buffer.append(event) }
 ```
 
-A fetch that finishes after a `.now` write wins: rows it saves and the data it returns replace what the write stored. Rows only the write touched stay.
+A fetch that finishes after a `.now` write wins: rows it saves and the data it returns replace what the write stored. Rows only the write touched stay. Query data a `.now` write sets before the stream first syncs is kept in memory only, so a cursor moved past events no fetch has covered isn't saved; it's replaced when that fetch succeeds, and dropped if the stream ends first.
 
 If an optimistic mutation's request fails after a stream wrote the same row, its rollback overwrites the stream's change. The mutation's `invalidates:` refetch then brings the row up to date.
 

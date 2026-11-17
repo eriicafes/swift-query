@@ -370,11 +370,11 @@ struct FetcherTests {
         await server.checkpoints.reached("fetch-cancelled")
         // Created while remove waits for the first key's fetch to stop.
         let late = provider.client(for: TestDetail(id: "2"))
-        #expect(late.state.isPending)
         await server.checkpoints.release("fetch")
         await refresh.value
         await removal.value
 
+        #expect(late.state.isPending)
         #expect(try record(provider, stored) == nil)
         #expect(try profiles(provider)["2"] == nil)
     }
@@ -384,6 +384,55 @@ struct FetcherTests {
         #expect(QueryRecord.Tags.decode(QueryRecord.Tags.encode([""])) == [""])
         #expect(QueryRecord.Tags.decode(QueryRecord.Tags.encode(["", "a"])) == ["", "a"])
         #expect(QueryRecord.Tags.decode("").isEmpty)
+    }
+
+    @Test("remove finishes when a fetch it stops queries another key it removes")
+    func removeWithNestedQuery() async throws {
+        let server = FakeServer()
+        let ref = ProviderRef()
+        let provider = QueryProvider(
+            modelContainer: try makeContainer(),
+            contexts: TestUser.Context(server: server), TestNested.Context(server: server, ref: ref),
+            fetchers: TestDetail.self, TestNested.self
+        )
+        ref.provider = provider
+        await provider.waitForGarbageCollection()
+        let nested = provider.client(for: TestNested())
+        await server.checkpoints.hold("nested")
+        let refresh = Task { await nested.refresh() }
+        await server.checkpoints.reached("nested")
+
+        let done = Flag()
+        Task {
+            await provider.remove(.all)
+            done.value = true
+        }
+        for _ in 0..<50 { await Task.yield() }
+        // The fetch being stopped queries TestDetail(9), which remove also matches.
+        await server.checkpoints.release("nested")
+        await eventually { done.value }
+        // On a deadlock, `eventually` has recorded the failure; don't wait forever for it.
+        guard done.value else { return }
+        await refresh.value
+        #expect(provider.getQueryData(for: TestDetail(id: "9")) == nil)
+    }
+
+    @Test("A fetch cancelled through URLSession's error is still a cancel, not a failure")
+    func urlErrorCancel() async throws {
+        let (provider, rates) = try makeRates()
+        await rates.useURLErrors()
+        let key = TestStoredRate(from: "USD")
+        try await provider.query(key)
+        await rates.checkpoints.hold("rate")
+
+        let query = Task { try await provider.query(key, staleTime: .after(.zero)) }
+        await rates.checkpoints.reached("rate", count: 2)
+        await provider.cancel(.type(TestStoredRate.self))
+        await rates.checkpoints.release("rate")
+
+        await #expect(throws: CancellationError.self) { try await query.value }
+        #expect(provider.client(for: key).error == nil)
+        #expect(provider.client(for: key).state.isStale == false)
     }
 
     // MARK: Provider methods

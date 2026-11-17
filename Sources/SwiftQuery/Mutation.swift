@@ -86,20 +86,29 @@ final class OptimisticRecorder {
 /// one can tell whether rolling back would clobber this newer edit.
 struct OptimisticEntry {
     let id: UInt64
-    let scope: AnyHashable?
     let filters: [QueryFilter]
     /// The mutation while it runs, so an older one can hand it a rollback.
     weak var run: MutationRun?
     /// Whether its remote call succeeded, or `nil` until it's decided.
     var succeeded: Bool?
 
-    /// Whether this mutation may have edited what a mutation with `scope` and `filters` edited:
-    /// it shares the scope, or their filters overlap. Mutations without filters overlap nothing
-    /// by filters, since nothing would refetch to repair a skipped rollback.
-    func overlaps(scope: AnyHashable?, filters: [QueryFilter]) -> Bool {
-        if let scope, scope == self.scope { return true }
-        return self.filters.contains { mine in filters.contains { mine.overlaps($0) } }
+    /// Whether this mutation may have edited what a mutation with `filters` edited: their filters
+    /// overlap. Sharing a scope doesn't count, since it doesn't say which data either edited, and
+    /// mutations without filters overlap nothing, since nothing would refetch to repair a
+    /// rollback that didn't run.
+    func overlaps(filters: [QueryFilter]) -> Bool {
+        self.filters.contains { mine in filters.contains { mine.overlaps($0) } }
     }
+}
+
+/// A failed mutation's rollbacks, passed to a newer overlapping mutation whose call hasn't
+/// returned. They run after that mutation's own if it fails too.
+struct InheritedRollback {
+    let id: UInt64
+    let rows: MutationRollback?
+    let data: [@MainActor () async -> Void]
+    /// Refetched once the rollbacks run, since their keys may have refetched in the meantime.
+    let filters: [QueryFilter]
 }
 
 /// Shared bookkeeping for a set of mutations: how many are pending, and which keys to
@@ -179,9 +188,10 @@ final class MutationRun {
     let gate: MutationGate?
     /// The key of the record marking this mutation as pending, if it has an optimistic update.
     let marker: String?
-    /// Rollbacks of older failed mutations that this one's edit covered, by mutation id. They run
-    /// after this mutation's own if it fails too, and are dropped if it succeeds.
-    var inheritedRollbacks: [(id: UInt64, rollback: MutationRollback)] = []
+    /// Rollbacks of older failed mutations that this one's edit covered. They run after this
+    /// mutation's own if it fails too. If it succeeds, their row rollbacks are dropped, and their
+    /// query data restores still run, since each only applies while its key holds that edit.
+    var inherited: [InheritedRollback] = []
 
     init(
         id: UInt64,
@@ -249,16 +259,23 @@ extension QueryProvider {
                 })
             } catch {
                 // Newest first, so each restore finds the data its own step left. The update may
-                // have cancelled fetches of these keys, so they refetch afterwards.
+                // have cancelled fetches of these keys, so they refetch afterwards. Query data it
+                // changed is already stored, so it's marked pending until then, in case the app
+                // is terminated first.
                 let rollbacks = recorder.dataRollbacks.reversed()
                 let changed = recorder.filters
+                if marker == nil, !changed.isEmpty {
+                    marker = markPendingMutation(changed)
+                }
+                let markers = [marker].compactMap { $0 }
                 Task {
                     for rollback in rollbacks { await rollback() }
-                    if !changed.isEmpty {
-                        await self.invalidateAndRefetch(changed, refetch: .active)
+                    let invalidated = changed.isEmpty
+                        ? true : await self.invalidateAndRefetch(changed, refetch: .active)
+                    if invalidated {
+                        self.releasePendingMutations(markers)
                     }
                 }
-                releasePendingMutations([marker].compactMap { $0 })
                 if let scopeKey { mutations.release(scopeKey, group) }
                 throw error
             }
@@ -302,7 +319,7 @@ extension QueryProvider {
         )
         if run.isOptimistic {
             optimisticFilters[id] = filters
-            optimisticHistory.append(OptimisticEntry(id: id, scope: scopeKey, filters: filters, run: run))
+            optimisticHistory.append(OptimisticEntry(id: id, filters: filters, run: run))
             undecidedOptimistic.insert(id)
             holdCoveredClients()
         }
@@ -332,47 +349,57 @@ extension QueryProvider {
             run.group.pending -= 1
             optimisticFilters[run.id] = nil
             var skippedRollback = false
-            var rollbacks = run.inheritedRollbacks
-            if let rollback = run.rollback {
-                rollbacks.append((run.id, rollback))
-            }
-            if !rollbacks.isEmpty {
-                switch rollbackDecision(for: run) {
-                case .apply:
-                    let context = modelContainer.mainContext
-                    do {
-                        // Newest first: each restores the values the one after it found.
-                        for entry in rollbacks.sorted(by: { $0.id > $1.id }) {
-                            try entry.rollback(context)
-                        }
-                        try Self.saveIfNeeded(context)
-                    } catch {
-                        skippedRollback = true
+            // Newest first: each restores the values the one after it found.
+            let rollbacks = (run.inherited + [InheritedRollback(
+                id: run.id, rows: run.rollback, data: run.dataRollbacks, filters: run.filters
+            )]).sorted { $0.id > $1.id }
+            var restoresData = true
+            switch rollbackDecision(for: run) {
+            case .apply:
+                let context = modelContainer.mainContext
+                do {
+                    for entry in rollbacks {
+                        try entry.rows?(context)
                     }
-                case .handOff(let heir):
-                    // A newer edit covers the same data and its call hasn't returned: roll back
-                    // with it if it fails too, or drop this rollback if it succeeds.
-                    heir.inheritedRollbacks += rollbacks
-                    skippedRollback = true
-                case .drop:
-                    // A newer edit to the same data succeeded; rolling back would clobber it.
+                    try Self.saveIfNeeded(context)
+                } catch {
                     skippedRollback = true
                 }
+            case .handOff(let heir):
+                // A newer edit covers the same data and its call hasn't returned: roll back with
+                // it if it fails too.
+                heir.inherited += rollbacks
+                restoresData = false
+                skippedRollback = true
+            case .drop:
+                // A newer edit to the same data succeeded; rolling rows back would clobber it.
+                skippedRollback = run.rollback != nil || !run.inherited.isEmpty
             }
             decide(run, succeeded: false)
-            // Query data only restores while it still holds this update, so it never clobbers
-            // a newer one. Newest first, so each restore finds the data its own step left.
-            for rollback in run.dataRollbacks.reversed() {
-                await rollback()
+            if restoresData {
+                // Query data only restores while it still holds that update, so it never
+                // clobbers a newer one.
+                for entry in rollbacks {
+                    for restore in entry.data.reversed() {
+                        await restore()
+                    }
+                }
             }
-            await settle(run, skippedRollback: skippedRollback)
+            await settle(run, skippedRollback: skippedRollback, inherited: run.inherited.flatMap(\.filters))
             throw error
         }
         run.gate?.open()
         run.group.pending -= 1
         optimisticFilters[run.id] = nil
         decide(run, succeeded: true)
-        await settle(run, skippedRollback: false)
+        // Inherited query data restores still run; each applies only while its key holds that
+        // failed edit. Their row rollbacks are dropped, since this edit replaced them.
+        for entry in run.inherited.sorted(by: { $0.id > $1.id }) {
+            for restore in entry.data.reversed() {
+                await restore()
+            }
+        }
+        await settle(run, skippedRollback: false, inherited: run.inherited.flatMap(\.filters))
         return result
     }
 
@@ -382,17 +409,16 @@ extension QueryProvider {
         case drop
     }
 
-    /// What to do with a failed mutation's rollbacks, given the newer optimistic mutations that
-    /// may have edited the same data: one in the same scope, or whose filters overlap.
-    /// - One of them succeeded: drop them, since rolling back would clobber its edit.
-    /// - One hasn't returned: hand them to the newest such mutation, to run if it fails too.
+    /// What to do with a failed mutation's rollbacks, given the newer optimistic mutations whose
+    /// filters overlap its own:
+    /// - One of them succeeded: drop the row rollbacks, since they would clobber its edit.
+    /// - One hasn't returned: hand them to the oldest such mutation, which decides again when
+    ///   it fails, so a mutation that succeeds in between is never rolled back over.
     /// - Otherwise (none, or all failed and rolled back to this one's edit): apply them.
     private func rollbackDecision(for run: MutationRun) -> RollbackDecision {
-        let newer = optimisticHistory.filter {
-            $0.id > run.id && $0.overlaps(scope: run.scope, filters: run.filters)
-        }
+        let newer = optimisticHistory.filter { $0.id > run.id && $0.overlaps(filters: run.filters) }
         if newer.contains(where: { $0.succeeded == true }) { return .drop }
-        if let heir = newer.last(where: { $0.succeeded == nil })?.run { return .handOff(heir) }
+        if let heir = newer.first(where: { $0.succeeded == nil })?.run { return .handOff(heir) }
         return .apply
     }
 
@@ -410,17 +436,20 @@ extension QueryProvider {
 
     /// Invalidates the mutation's keys, or for a scope, every key its mutations touched once
     /// nothing in it is pending. After a skipped rollback, the keys refetch even where no view
-    /// shows them, so the edit it left behind is replaced by the server's data.
-    private func settle(_ run: MutationRun, skippedRollback: Bool) async {
+    /// shows them, so the edit it left behind is replaced by the server's data. `inherited` are
+    /// the keys of older mutations whose rollbacks this one received; they refetch the same way,
+    /// since those rollbacks may have run over data refetched in the meantime.
+    private func settle(_ run: MutationRun, skippedRollback: Bool, inherited: [QueryFilter]) async {
+        let skippedRollback = skippedRollback || !inherited.isEmpty
         guard let scope = run.scope else {
             // A marker whose keys couldn't all be marked invalidated stays, so the next launch
             // invalidates them instead.
-            if await invalidateAndRefetch(run.filters, refetch: skippedRollback ? .all : .active) {
+            if await invalidateAndRefetch(run.filters + inherited, refetch: skippedRollback ? .all : .active) {
                 releasePendingMutations([run.marker].compactMap { $0 })
             }
             return
         }
-        run.group.filters.formUnion(run.filters)
+        run.group.filters.formUnion(run.filters + inherited)
         run.group.skippedRollback = run.group.skippedRollback || skippedRollback
         run.group.markers += [run.marker].compactMap { $0 }
         guard run.group.pending == 0 else { return }

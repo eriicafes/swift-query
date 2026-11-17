@@ -396,17 +396,19 @@ struct ProviderMutationTests {
 
     @Test("A skipped rollback runs after a newer overlapping mutation's if that one fails too")
     func handedOffRollback() async throws {
+        // Overlapping filters on a key with no client, so nothing refetches the edited row.
+        let overlap = QueryFilter.key(TestDetail(id: "1"))
         let (provider, users, server) = try await loaded(observed: false)
         await server.checkpoints.hold("rename:First")
 
         let first = Task {
-            try await provider.mutate(scope: "s", {
+            try await provider.mutate(scope: "s", invalidates: [overlap], {
                 try await server.rename(id: "1", to: "First", fail: true)
             }, optimistic: renameRow("1", to: "First"))
         }
         await server.checkpoints.reached("rename:First")
         let second = Task {
-            try await provider.mutate(scope: "s", {
+            try await provider.mutate(scope: "s", invalidates: [overlap], {
                 try await server.rename(id: "1", to: "Second", fail: true)
             }, optimistic: renameRow("1", to: "Second"))
         }
@@ -422,17 +424,19 @@ struct ProviderMutationTests {
 
     @Test("A skipped rollback is dropped when the newer overlapping mutation succeeds")
     func droppedRollback() async throws {
+        // Overlapping filters on a key with no client, so nothing refetches the edited row.
+        let overlap = QueryFilter.key(TestDetail(id: "1"))
         let (provider, users, server) = try await loaded(observed: false)
         await server.checkpoints.hold("rename:First")
 
         let first = Task {
-            try await provider.mutate(scope: "s", {
+            try await provider.mutate(scope: "s", invalidates: [overlap], {
                 try await server.rename(id: "1", to: "First", fail: true)
             }, optimistic: renameRow("1", to: "First"))
         }
         await server.checkpoints.reached("rename:First")
         let second = Task {
-            try await provider.mutate(scope: "s", {
+            try await provider.mutate(scope: "s", invalidates: [overlap], {
                 try await server.rename(id: "1", to: "Second")
             }, optimistic: renameRow("1", to: "Second"))
         }
@@ -487,6 +491,117 @@ struct ProviderMutationTests {
         await detail.settle()
         #expect(detail.state.isStale == false)
         detail.detach()
+    }
+
+    @Test("A rollback isn't handed past a mutation that succeeds in between")
+    func handOffToOldest() async throws {
+        let (provider, users, server) = try await loaded(observed: false)
+        let overlap = QueryFilter.key(TestDetail(id: "1"))
+        for name in ["First", "Middle", "Last"] {
+            await server.checkpoints.hold("rename:\(name)")
+        }
+        func start(_ name: String, fail: Bool) -> Task<Void, any Error> {
+            Task {
+                try await provider.mutate(invalidates: [overlap], {
+                    _ = try await server.rename(id: "1", to: name, fail: fail)
+                }, optimistic: renameRow("1", to: name))
+            }
+        }
+        let first = start("First", fail: true)
+        await server.checkpoints.reached("rename:First")
+        let middle = start("Middle", fail: false)
+        await server.checkpoints.reached("rename:Middle")
+        let last = start("Last", fail: true)
+        await server.checkpoints.reached("rename:Last")
+
+        await server.checkpoints.release("rename:First")
+        await #expect(throws: ServerError.self) { try await first.value }
+        await server.checkpoints.release("rename:Middle")
+        try await middle.value
+        await server.checkpoints.release("rename:Last")
+        await #expect(throws: ServerError.self) { try await last.value }
+        // The server has "Middle"; First's rollback was dropped when Middle succeeded.
+        #expect(try localUsers(users)["1"] == "Middle")
+    }
+
+    @Test("Query data restores follow a handed-off rollback")
+    func dataRestoresHandedOff() async throws {
+        let (provider, _, server) = try await loaded(observed: false)
+        let key = TestDetail(id: "1")
+        await provider.client(for: key).refresh()
+        let before = try #require(provider.getQueryData(for: key))
+        await server.checkpoints.hold("rename:A")
+        await server.checkpoints.hold("rename:B")
+        func start(_ name: String) -> Task<Void, any Error> {
+            Task {
+                try await provider.mutate({
+                    _ = try await server.rename(id: "1", to: name, fail: true)
+                }, optimistic: { tx in tx.setQueryData(for: key) { $0.version += 1 } })
+            }
+        }
+        let a = start("A")
+        await server.checkpoints.reached("rename:A")
+        let b = start("B")
+        await server.checkpoints.reached("rename:B")
+        await provider.client(for: key).settleOperations()
+        // The refetches after the failures fail too, so only the restores decide the data.
+        await server.failNextFetch()
+        await server.failNextFetch()
+
+        await server.checkpoints.release("rename:A")
+        await #expect(throws: ServerError.self) { try await a.value }
+        await server.checkpoints.release("rename:B")
+        await #expect(throws: ServerError.self) { try await b.value }
+        #expect(provider.getQueryData(for: key) == before)
+    }
+
+    @Test("A shared scope alone doesn't hold back a rollback")
+    func scopeAloneDoesNotDefer() async throws {
+        let (provider, users, server) = try await loaded(observed: false)
+        await server.checkpoints.hold("rename:First")
+        await server.checkpoints.hold("rename:Second")
+
+        let first = Task {
+            try await provider.mutate(scope: "s", {
+                try await server.rename(id: "1", to: "First", fail: true)
+            }, optimistic: renameRow("1", to: "First"))
+        }
+        await server.checkpoints.reached("rename:First")
+        let second = Task {
+            try await provider.mutate(scope: "s", {
+                try await server.rename(id: "2", to: "Second")
+            }, optimistic: renameRow("2", to: "Second"))
+        }
+        await eventually { (try? localUsers(users)["2"]) == "Second" }
+        await server.checkpoints.release("rename:First")
+        await #expect(throws: ServerError.self) { try await first.value }
+        // Rolled back at once, though a newer mutation in its scope is still pending.
+        #expect(try localUsers(users)["1"] == "Ada")
+        await server.checkpoints.release("rename:Second")
+        _ = try await second.value
+        #expect(try localUsers(users)["1"] == "Ada")
+    }
+
+    @Test("refetch waits for an optimistic mutation covering the key")
+    func refetchRespectsHold() async throws {
+        let (provider, _, server) = try await loaded(observed: false)
+        let key = TestDetail(id: "1")
+        await provider.client(for: key).refresh()
+        await server.checkpoints.hold("rename:x")
+        let mutation = Task {
+            try await provider.mutate({
+                _ = try await server.rename(id: "1", to: "x")
+            }, optimistic: { tx in tx.setQueryData(for: key) { $0.version += 10 } })
+        }
+        await server.checkpoints.reached("rename:x")
+        let fetches = await server.fetchCount
+
+        await provider.refetch(.key(key), type: .all)
+        #expect(await server.fetchCount == fetches)
+
+        await server.checkpoints.release("rename:x")
+        try await mutation.value
+        #expect(await server.fetchCount == fetches + 1)
     }
 
     @Test("Unscoped calls through one mutation observer roll back independently")

@@ -241,6 +241,16 @@ public final class QueryProvider {
         }
     }
 
+    /// Lets go of a fetcher key's client right away if nothing uses it: no view, fetch or
+    /// mutation, and no hold whose deferred fetch it must run.
+    func releaseIfIdle<F: QueryFetcher>(_ fetcher: F) {
+        let id = AnyHashable(fetcher)
+        guard let client = clients[id]?.client as? QueryObserver<F>,
+              !client.isModel, !client.isActive, !client.isHeld
+        else { return }
+        retained[id] = nil
+    }
+
     /// Waits for a scheduled sweep to finish.
     func waitForGarbageCollection() async {
         await garbageCollection?.value
@@ -353,12 +363,13 @@ public final class QueryProvider {
     /// - On failure, the rollbacks registered with ``OptimisticContext/onRollback(_:)`` run and
     ///   query data changed with ``OptimisticContext/setQueryData(for:_:)-(F,_)`` is restored,
     ///   then the error is rethrown. Query data is only restored if nothing has changed it since.
-    ///   If a newer optimistic mutation may have edited the same data (one in the same scope, or
-    ///   one whose filters overlap this mutation's: a tag or `.all` overlaps every filter; keys
-    ///   and types overlap when they match a common key), the rollbacks don't run now, so they
-    ///   can't clobber its change. While that mutation's call is in flight, they pass to it and
-    ///   run after its own if it fails too; if it succeeded, they're dropped. The mutation's keys
-    ///   that have a client then refetch even where no view shows them.
+    ///   If a newer optimistic mutation may have edited the same data, the row rollbacks don't
+    ///   run now, so they can't clobber its change. A newer mutation counts when its filters
+    ///   overlap this mutation's: a tag or `.all` overlaps every filter; keys and types overlap
+    ///   when they match a common key. Sharing a scope doesn't count, so scoped mutations that
+    ///   edit the same rows should list them in `invalidates`. While the oldest such mutation's
+    ///   call is in flight, the rollbacks pass to it and run after its own if it fails too; if
+    ///   one succeeded, they're dropped. The keys then refetch even where no view shows them.
     /// - Whether it succeeds or fails, the mutation settles by invalidating the keys matching
     ///   `invalidates`, plus any key whose query data the optimistic update changed. Keys shown
     ///   in a view refetch with a request sent after the mutation, and `mutate` waits for them; a
@@ -439,9 +450,10 @@ public final class QueryProvider {
     ///
     /// `type` picks which keys: `.active` (the default) refetches keys shown in a view;
     /// `.inactive` refetches every other key the provider knows about, including stored keys of
-    /// listed types that have no client, a few at a time; `.all` refetches both. A key that was never fetched, or
-    /// whose data was removed, has nothing to refetch. To fetch any key unconditionally, use
-    /// ``query(_:staleTime:)-(F,_)`` with `staleTime: .after(.zero)`.
+    /// listed types that have no client, a few at a time; `.all` refetches both. A key that was
+    /// never fetched, or whose data was removed, has nothing to refetch. A key an optimistic
+    /// mutation in flight covers fetches once that mutation settles instead. To fetch any key
+    /// unconditionally, use ``query(_:staleTime:)-(F,_)`` with `staleTime: .after(.zero)`.
     public func refetch(_ filters: QueryFilter..., type: QueryType = .active) async {
         await refetch(filters, type: type)
     }
@@ -470,7 +482,8 @@ public final class QueryProvider {
 
     /// Evicts expired SWR caches of live clients that are unobserved and idle, and of every
     /// stored key without a client, using each record's stored cache time. Records of types no
-    /// longer listed are deleted without `evict`; `.forever` records are kept.
+    /// longer listed are deleted (a model's is cleared) without `evict`; `.forever` records are
+    /// kept.
     ///
     /// The provider already runs this at launch and whenever the app goes to the background;
     /// call it yourself only to clean up at another time.
@@ -561,23 +574,6 @@ public final class QueryProvider {
         let result = await operation.value
         pendingStoreWrites[id] = nil
         return result
-    }
-
-    /// Makes clients created for a key `filters` match wait until ``endCover(_:)``, as if a store
-    /// write were running. For work that spans several steps, such as `remove`.
-    private func beginCover(_ filters: [QueryFilter], evicts: Bool) -> UInt64 {
-        let (stream, continuation) = AsyncStream.makeStream(of: Never.self)
-        let task = Task { for await _ in stream {} }
-        nextStoreWriteID &+= 1
-        let id = nextStoreWriteID
-        pendingStoreWrites[id] = PendingStoreWrite(
-            filters: filters, evicts: evicts, task: task, finish: { continuation.finish() }
-        )
-        return id
-    }
-
-    private func endCover(_ id: UInt64) {
-        pendingStoreWrites.removeValue(forKey: id)?.finish?()
     }
 
     /// Marks stored keys without a client as invalidated. Returns whether every key was marked.
@@ -753,19 +749,35 @@ public final class QueryProvider {
     /// keys removed together don't refetch each other. With `refetchObserved`, removed keys a
     /// view still shows fetch again last, and this waits for them.
     private func remove(_ filters: [QueryFilter], refetchObserved: Bool) async {
-        // A client created while this runs waits for it and starts empty, and its stored record
-        // is evicted with the rest instead of being skipped as live.
-        let cover = beginCover(filters, evicts: true)
         var evicted = Evicted()
-        let clients = liveClients(matching: filters)
-        for client in clients where await client.remove() {
-            evicted.add(client.recordKey, tags: client.tagSet)
+        var clients: [any AnyQueryObserver] = []
+        // Clients are removed in parallel, then any matching client created meanwhile, until
+        // none is left, so a key whose client appeared during the removal is removed too. New
+        // clients aren't made to wait, since a fetch being stopped here may be what creates one.
+        while true {
+            let handled = Set(clients.map(\.recordKey))
+            let batch = liveClients(matching: filters).filter { !handled.contains($0.recordKey) }
+            guard !batch.isEmpty else { break }
+            clients += batch
+            let removals: [@MainActor () async -> (String, Set<String>)?] = batch.map { client in
+                { await client.remove() ? (client.recordKey, client.tagSet) : nil }
+            }
+            await withTaskGroup(of: (String, Set<String>)?.self) { group in
+                for removal in removals {
+                    group.addTask { await removal() }
+                }
+                for await case let (key, tags)? in group {
+                    evicted.add(key, tags: tags)
+                }
+            }
         }
-        let excluded = Set(clients.map(\.recordKey))
+        // Clients from here on wait for the store write, which never waits on a client. Every
+        // live client is excluded: the matching ones were removed above, and the others don't
+        // match, even if their stored tags (from an older version of the fetcher) do.
+        let excluded = liveKeys
         evicted.formUnion(await writeStore(covering: filters, evicts: true) { store in
             await store.evict(matching: filters, except: excluded)
         })
-        endCover(cover)
         await invalidateShared(evicted)
         if refetchObserved {
             let resyncs: [@MainActor () async -> Void] = clients.map { client in
@@ -784,12 +796,10 @@ public final class QueryProvider {
 struct PendingStoreWrite {
     let evicts: Bool
     let task: Task<Void, Never>
-    /// Ends a cover started with `beginCover`; `nil` for a store write, which ends on its own.
-    let finish: (@Sendable () -> Void)?
     private let keys: Set<String>
     private let filters: [QueryFilter]
 
-    init(filters: [QueryFilter], evicts: Bool, task: Task<Void, Never>, finish: (@Sendable () -> Void)? = nil) {
+    init(filters: [QueryFilter], evicts: Bool, task: Task<Void, Never>) {
         var keys = Set<String>()
         var others: [QueryFilter] = []
         for filter in filters {
@@ -803,7 +813,6 @@ struct PendingStoreWrite {
         self.filters = others
         self.evicts = evicts
         self.task = task
-        self.finish = finish
     }
 
     /// Whether the write covers the key. Key filters are looked up, so a garbage-collection sweep
@@ -852,6 +861,8 @@ struct FetcherEntry {
             refresh: { key, provider in
                 guard let fetcher = QueryRecord.Key.decode(F.self, from: key) else { return }
                 await provider.client(for: fetcher).refetchIfFetched()
+                // Created only for this fetch, so it isn't kept for the keep-alive time.
+                provider.releaseIfIdle(fetcher)
             }
         )
     }

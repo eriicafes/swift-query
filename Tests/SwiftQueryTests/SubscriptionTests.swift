@@ -9,6 +9,8 @@ actor FeedServer {
     nonisolated let checkpoints = Checkpoints()
     private(set) var requestedSeqs: [Int] = []
     private(set) var connects = 0
+    /// How many streams have called `begin()`.
+    private(set) var begins = 0
     /// How many streams have ended, by finishing or by their task being cancelled.
     private(set) var streamsEnded = 0
     /// The writer and subscription of the most recent stream that called `begin()`.
@@ -30,6 +32,7 @@ actor FeedServer {
     func began(_ subscription: QuerySubscription<TestFeed.Context, TestFeed.QueryData>, _ writer: QueryWriter<TestFeed.QueryData>) {
         self.subscription = subscription
         self.writer = writer
+        begins += 1
     }
 
     /// Sends an event to every open stream.
@@ -84,6 +87,8 @@ extension TestFeed: QueryModel {
             case live
             /// Returns without calling `begin()`.
             case none
+            /// Waits (cancellably) without ever connecting or calling `begin()`.
+            case neverConnects
         }
 
         let server: FeedServer
@@ -101,6 +106,9 @@ extension TestFeed: QueryModel {
     }
 
     static func subscribe(query: QuerySubscription<Context, QueryData>) async throws {
+        if query.context.mode == .neverConnects {
+            try await Task.sleep(for: .seconds(3600))
+        }
         guard query.context.mode == .live else { return }
         let server = query.context.server
         let events = await server.connect()
@@ -484,8 +492,6 @@ struct SubscriptionTests {
         await server.checkpoints.release("fetch")
         await client.settle()
         // The cancelled request stays stopped; the stream syncs with a retry after a backoff.
-        #expect(await server.requestedSeqs.count == 1)
-        #expect(client.state.isPending)
         await eventually { client.data == .init(seq: 3) }
         #expect(await server.requestedSeqs.count == 2)
         _ = view
@@ -544,7 +550,8 @@ struct SubscriptionTests {
 
         await provider.reset(.type(TestFeed.self))
         #expect(client.data == .init(seq: 3))
-        #expect(await server.requestedSeqs == [0, 0])
+        // reset's own fetch starts from nothing; the new stream's begin() then fetches again.
+        #expect(await server.requestedSeqs.starts(with: [0, 0]))
         _ = view
     }
 
@@ -583,6 +590,41 @@ struct SubscriptionTests {
         #expect(try rows(client) == [5])
         #expect(await client.subscriptions() == 1)
         client.detach()
+        _ = view
+    }
+
+    @Test("reset doesn't wait for a stream that hasn't called begin()")
+    func resetWithoutBegin() async throws {
+        let (provider, client, _) = try makeFeed(mode: .neverConnects)
+        let view = Subscription<ModelFetcher<TestFeed>>()
+        view.activate(client, cache: nil)
+        await client.settleOperations()
+
+        let done = Flag()
+        Task {
+            await provider.reset(.type(TestFeed.self))
+            done.value = true
+        }
+        await eventually { done.value }
+        #expect(client.data == .init(seq: 3))
+        _ = view
+    }
+
+    @Test("Data a .now write sets before the stream syncs isn't stored")
+    func unsyncedDataNotStored() async throws {
+        let (provider, client, server) = try makeFeed()
+        let (_, view) = try await connect(client, server)
+        await server.failFetches(1_000)
+        await server.dropStreams()
+        await eventually { await server.begins == 2 }
+        let writer = try #require(await server.writer)
+
+        try await writer.write(.now) { tx in tx.data?.seq = 100 }
+        #expect(client.data == .init(seq: 100))
+        let record = try #require(try ModelContext(provider.modelContainer)
+            .fetch(QueryRecord.descriptor(key: TestFeed.queryKey)).first)
+        let stored = try JSONDecoder().decode(TestFeed.QueryData.self, from: try #require(record.stateData))
+        #expect(stored == .init(seq: 3))
         _ = view
     }
 

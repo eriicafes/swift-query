@@ -313,12 +313,18 @@ actor FakeRates: RateSource {
     nonisolated let checkpoints = Checkpoints()
     private(set) var requests: [String] = []
     private var failures = 0
+    /// Whether a cancelled request throws `URLError(.cancelled)`, as URLSession does.
+    private var urlErrors = false
 
     func failNext() { failures += 1 }
+    func useURLErrors() { urlErrors = true }
 
     func rate(from: String, to: String) async throws -> Double {
         requests.append("\(from)-\(to)")
         await checkpoints.pass("rate")
+        if urlErrors, Task.isCancelled {
+            throw URLError(.cancelled)
+        }
         if failures > 0 {
             failures -= 1
             throw ServerError()
@@ -446,5 +452,29 @@ struct TestSlowEvict: QueryFetcher {
     func evict(query: QueryEvict<Void>) throws {
         EvictLatch.shared.pass()
         try query.modelContext.delete(model: TestProfile.self, where: #Predicate { $0.userID == "slow" })
+    }
+}
+
+/// Lets a fetch context reach the provider, which is created after its contexts.
+final class ProviderRef: @unchecked Sendable {
+    @MainActor weak var provider: QueryProvider?
+}
+
+/// A fetcher whose fetch queries another key through the provider, as a fetch that needs
+/// related data might.
+struct TestNested: QueryFetcher {
+    struct Context: Sendable {
+        let server: FakeServer
+        let ref: ProviderRef
+    }
+
+    var cache: QueryCache? { .forever() }
+
+    func fetch(query: QueryFetch<Context, Int>) async throws -> Int {
+        await query.context.server.checkpoints.pass("nested")
+        let ref = query.context.ref
+        let provider = await MainActor.run { ref.provider }
+        _ = try await provider?.query(TestDetail(id: "9"))
+        return 1
     }
 }

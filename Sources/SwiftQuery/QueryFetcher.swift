@@ -85,7 +85,8 @@ public protocol QueryFetcher: Queryable, Hashable, Codable, Sendable {
     ///   key, `subscribe` is called again after a backoff, and its `begin()` fetches what was
     ///   missed. Throwing before `begin()` fetches right away if a view is waiting for the data.
     /// - Returning without calling `begin()` means the key has no live updates: the key fetches
-    ///   normally, and `subscribe` isn't called again until the next sync from a view. The default
+    ///   normally, and `subscribe` is called again only when the key next syncs while a view
+    ///   shows it, such as when a view appears or after an invalidation. The default
     ///   implementation does this.
     /// - Respect cancellation: the stream is cancelled once no view has shown the key for the
     ///   provider's `keepAliveTime`, and when its cache is removed, which waits for it to stop.

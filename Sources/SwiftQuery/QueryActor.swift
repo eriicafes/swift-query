@@ -7,6 +7,11 @@ struct QuerySnapshot: Sendable {
         case pending
         case success(Data, stale: Bool)
         case error(any Error)
+
+        /// The encoded data, if any.
+        var data: Data? {
+            if case .success(let data, _) = self { data } else { nil }
+        }
     }
 
     var sequence: UInt64
@@ -89,6 +94,9 @@ actor QueryActor<Fetcher: QueryFetcher> {
     /// Whether the last `subscribe` returned without calling `begin()`: the key has no live
     /// updates, so syncs fetch right away instead of waiting for `begin()`.
     private var subscribeDeclined = false
+    /// Whether the client is gone. Operations it queued before going may still run, but no
+    /// stream starts again.
+    private var stopped = false
     private var streamStartedAt: ContinuousClock.Instant?
     private var restartDelay: Duration
     private var beginRetryDelay: Duration
@@ -102,6 +110,10 @@ actor QueryActor<Fetcher: QueryFetcher> {
     /// The data from the last successful fetch. A retry of the `begin()` fetch reads `previous`
     /// from it, so data a stream wrote before it synced can't make the fetch skip anything.
     private var lastFetchedData: Data?
+    /// Data a stream wrote before it first synced. Kept in memory only, so a cursor it advanced
+    /// past events no fetch has covered can't be stored and survive a relaunch. Dropped when a
+    /// fetch succeeds or the stream ends.
+    private var unsyncedData: Data?
     private var observers = 0
     /// The cache policy of the most recent sync, used by garbage collection so per-view
     /// overrides such as `.swr(gcTime:)` are honored.
@@ -173,7 +185,8 @@ actor QueryActor<Fetcher: QueryFetcher> {
     }
 
     /// Checks freshness against `cache` and starts a deduplicated fetch when required.
-    /// Returns once the fetch has started, not when it finishes.
+    /// Returns once the fetch has started, or been left to a stream's `begin()`, not when it
+    /// finishes.
     func sync(_ cache: QueryCache) async {
         await sync(cache, checkExpiry: observers == 0)
         if observers > 0 {
@@ -204,8 +217,15 @@ actor QueryActor<Fetcher: QueryFetcher> {
     ///
     /// An in-flight fetch may have been sent before a mutation reached the server, so it is
     /// awaited and then followed by a new fetch. A fetch that started after this call is joined.
+    ///
+    /// While an optimistic mutation holds the key, the fetch is deferred until the hold ends,
+    /// like a sync's, so the server's older data can't overwrite the edit.
     func refetch() async {
         loadIfNeeded()
+        if held, case .success = status {
+            deferredFetch = true
+            return
+        }
         if let current = inFlight {
             await current.task.value
             if let next = inFlight, next.id > current.id {
@@ -392,9 +412,11 @@ actor QueryActor<Fetcher: QueryFetcher> {
         guard observers > 0 else { return }
         await sync(lastCache ?? defaultCache, checkExpiry: false)
         ensureSubscribed()
-        // With a stream, the fetch waits for its begin(); wait for that first.
-        while fetchOnBegin {
-            await withCheckedContinuation { beginWaiters.append($0) }
+        // With a stream, the sync left the fetch to its begin(). Fetch now instead, so `reset`
+        // doesn't depend on the stream connecting; its begin() then fetches again after this.
+        if fetchOnBegin {
+            clearFetchOnBegin()
+            startHeldFetch()
         }
         if let inFlight {
             await inFlight.task.value
@@ -421,6 +443,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
     /// Stops the stream for a client that's gone, without starting a fetch a sync was leaving to
     /// its `begin()`.
     func stop() {
+        stopped = true
         clearFetchOnBegin()
         cancelSubscription()
     }
@@ -487,7 +510,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
             return
         }
         if needsFetch {
-            if observers > 0, !subscribeDeclined, !began {
+            if observers > 0, !subscribeDeclined, !began, !stopped {
                 // The stream's begin() fetches, so a stream that can't resume gets one fetch that
                 // covers its connection instead of two.
                 fetchOnBegin = true
@@ -556,9 +579,11 @@ actor QueryActor<Fetcher: QueryFetcher> {
             status = .success(data, stale: record.invalidated)
             lastError = nil
             lastFetchedData = data
+            unsyncedData = nil
             outcome = .succeeded
-        } catch is CancellationError {
-            // A cancelled fetch is not a failure; keep the previous state.
+        } catch let error where error is CancellationError || Task.isCancelled {
+            // A cancelled fetch is not a failure; keep the previous state. Checked through the
+            // task too, since URLSession reports a cancel as `URLError(.cancelled)`.
             rollback()
             lastCancelledFetch = id
             outcome = .cancelled
@@ -601,7 +626,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
 
     /// Calls `subscribe` if no stream is running.
     private func ensureSubscribed() {
-        guard subscriptionTask == nil else { return }
+        guard subscriptionTask == nil, !stopped else { return }
         subscriptionID &+= 1
         let id = subscriptionID
         resetStream()
@@ -716,6 +741,15 @@ actor QueryActor<Fetcher: QueryFetcher> {
         syncAfter = nil
         followUpFetch = false
         beginRetryDelay = initialBackoff
+        if unsyncedData != nil {
+            // Show the stored data again instead of what the stream wrote before it synced.
+            unsyncedData = nil
+            if let record = try? record(),
+               let (data, stale) = freshness(of: record, cache: lastCache ?? defaultCache, now: .now) {
+                status = .success(data, stale: stale)
+                Task { [weak self] in await self?.publishStatus() }
+            }
+        }
         let waiters = syncWaiters.values
         syncWaiters = [:]
         for waiter in waiters {
@@ -819,7 +853,10 @@ actor QueryActor<Fetcher: QueryFetcher> {
         context.autosaveEnabled = false
         let record = try record()
         let stored = record.stateData.flatMap { isDecodable($0) ? $0 : nil }
-        let initial = Self.decodedState(stored)
+        let previousUnsynced = unsyncedData
+        let initial = Self.decodedState(unsyncedData ?? stored)
+        // Before the stream syncs, data stays in memory; see `unsyncedData`.
+        let storesData = streamSynced
         var tx = QueryWriter<Fetcher.QueryData>.Transaction(
             modelContext: context,
             data: initial,
@@ -837,13 +874,17 @@ actor QueryActor<Fetcher: QueryFetcher> {
         // Data, then rows, with no suspension in between or before: no fetch can start or save
         // during the write. The data goes first because it can be put back if the rows fail.
         if let changedData {
-            record.stateData = changedData
-            do {
-                try save()
-            } catch {
-                rollback()
-                record.stateData = stored
-                throw error
+            if storesData {
+                record.stateData = changedData
+                do {
+                    try save()
+                } catch {
+                    rollback()
+                    record.stateData = stored
+                    throw error
+                }
+            } else {
+                unsyncedData = changedData
             }
         }
         if context.hasChanges {
@@ -852,15 +893,26 @@ actor QueryActor<Fetcher: QueryFetcher> {
             } catch {
                 context.rollback()
                 if changedData != nil {
-                    record.stateData = stored
-                    do { try save() } catch { rollback() }
+                    if storesData {
+                        record.stateData = stored
+                        do { try save() } catch { rollback() }
+                    } else {
+                        unsyncedData = previousUnsynced
+                    }
                 }
                 throw error
             }
         }
-        // Data written before anything synced is stored, but the key doesn't count as fetched.
-        if changedData != nil, let (data, stale) = freshness(of: record, cache: lastCache ?? defaultCache, now: .now) {
-            status = .success(data, stale: stale)
+        guard let changedData else { return result }
+        if storesData {
+            if let (data, stale) = freshness(of: record, cache: lastCache ?? defaultCache, now: .now) {
+                status = .success(data, stale: stale)
+                await publish()
+            }
+        } else if record.lastSyncedAt != nil {
+            // Shown, but the key doesn't count as fetched until the stream syncs.
+            let stale = if case .success(_, let stale) = status { stale } else { true }
+            status = .success(changedData, stale: stale)
             await publish()
         }
         return result
