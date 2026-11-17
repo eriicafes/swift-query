@@ -349,11 +349,15 @@ actor QueryActor<Fetcher: QueryFetcher> {
         return evicted
     }
 
-    /// Syncs again if a view still shows the key. Used by `reset` after removing it.
+    /// Syncs again if a view still shows the key, then waits for any fetch in flight. Used by
+    /// `reset` after removing it.
     func resyncIfObserved() async {
         guard observers > 0 else { return }
         await sync(lastCache ?? defaultCache, checkExpiry: false)
         ensureSubscribed()
+        if let inFlight {
+            await inFlight.task.value
+        }
     }
 
     /// Evicts the key if it expired while unobserved and idle, under the cache policy of the

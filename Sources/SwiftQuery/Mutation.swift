@@ -371,7 +371,7 @@ extension QueryProvider {
     /// shows them, so the edit it left behind is replaced by the server's data.
     private func settle(_ run: MutationRun, skippedRollback: Bool) async {
         guard let scope = run.scope else {
-            await invalidateAndRefetch(run.filters, everywhere: skippedRollback)
+            await invalidateAndRefetch(run.filters, refetch: skippedRollback ? .all : .active)
             releasePendingMutations([run.marker].compactMap { $0 })
             return
         }
@@ -386,7 +386,7 @@ extension QueryProvider {
         run.group.skippedRollback = false
         run.group.markers = []
         mutations.release(scope, run.group)
-        await invalidateAndRefetch(filters, everywhere: everywhere)
+        await invalidateAndRefetch(filters, refetch: everywhere ? .all : .active)
         releasePendingMutations(markers)
     }
 

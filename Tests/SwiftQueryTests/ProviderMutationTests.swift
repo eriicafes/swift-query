@@ -61,7 +61,7 @@ struct ProviderMutationTests {
         let other = provider.client(for: TestDetail(id: "2"))
         await other.refresh()
 
-        provider.invalidate(.type(TestUser.self), .key(TestDetail(id: "1")), .tag("user-1"))
+        await provider.invalidate(.type(TestUser.self), .key(TestDetail(id: "1")), .tag("user-1"))
         await users.settleOperations()
         await detail.settleOperations()
         await other.settleOperations()
@@ -605,7 +605,7 @@ struct ProviderMutationTests {
         await server.checkpoints.reached("rename:Held")
         #expect(try markerCount(provider) == 1)
         // Markers are bookkeeping, never matched by filters.
-        provider.invalidate(.all)
+        await provider.invalidate(.all)
         await provider.remove(.all)
         #expect(try markerCount(provider) == 1)
 
@@ -642,7 +642,7 @@ struct ProviderMutationTests {
             }, optimistic: renameRow("1", to: "Held"))
         }
         await server.checkpoints.reached("rename:Held")
-        provider.invalidate(.type(TestUser.self))
+        await provider.invalidate(.type(TestUser.self))
         users.sync()
         await users.settle()
         #expect(await server.fetchCount == fetches)

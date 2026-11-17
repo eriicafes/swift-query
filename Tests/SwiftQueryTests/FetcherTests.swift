@@ -49,7 +49,7 @@ struct FetcherTests {
     }
 
     @Test("Tags with commas and percent signs match exactly")
-    func tagEncoding() throws {
+    func tagEncoding() async throws {
         let tags: Set<String> = ["a,b", "50%", "plain"]
         #expect(QueryRecord.Tags.decode(QueryRecord.Tags.encode(tags)) == tags)
 
@@ -60,7 +60,7 @@ struct FetcherTests {
         context.insert(QueryRecord(key: "z", tags: QueryRecord.Tags.encode(["A"])))
         try context.save()
 
-        provider.invalidate(.tag("a"))
+        await provider.invalidate(.tag("a"))
         let invalidated = try ModelContext(provider.modelContainer)
             .fetch(FetchDescriptor<QueryRecord>(predicate: #Predicate { $0.invalidated }))
             .map(\.key)
@@ -156,12 +156,12 @@ struct FetcherTests {
         try context.save()
         let fetches = await server.fetchCount
 
-        provider.invalidate(.tag("user-1"))
+        await provider.invalidate(.tag("user-1"))
         await one.settle()
         #expect(await server.fetchCount == fetches + 1)
         #expect(one.state.isStale == false)
 
-        provider.invalidate(.tag("users"))
+        await provider.invalidate(.tag("users"))
         #expect(try record(provider, stored)?.invalidated == true)
         _ = subscription
     }
@@ -174,12 +174,89 @@ struct FetcherTests {
         await one.refresh()
         await two.refresh()
 
-        provider.invalidate(.type(TestDetail.self))
+        await provider.invalidate(.type(TestDetail.self))
         await one.settle()
         await two.settle()
         #expect(one.state.isStale)
         #expect(two.state.isStale)
         #expect(provider.client(for: TestUser.self).state.isStale == false)
+    }
+
+    @Test("invalidate waits for a request sent after it, even with a fetch in flight")
+    func invalidateDuringFetch() async throws {
+        let (provider, client, server) = try makeProvider()
+        let subscription = await observe(client)
+        await server.checkpoints.hold("fetch")
+        client.sync(.forever(refreshAfter: .zero))
+        await server.checkpoints.reached("fetch", count: 2)
+
+        let invalidation = Task { await provider.invalidate(.type(TestUser.self)) }
+        await eventually { client.state.isStale }
+        await server.checkpoints.release("fetch")
+        await invalidation.value
+
+        // The fetch in flight may predate the change; a new one replaces it.
+        #expect(await server.fetchCount == 3)
+        #expect(client.state.isStale == false)
+        _ = subscription
+    }
+
+    @Test("invalidate with refetch nil marks keys without fetching")
+    func invalidateWithoutRefetch() async throws {
+        let (provider, client, server) = try makeProvider()
+        let subscription = await observe(client)
+        let fetches = await server.fetchCount
+
+        await provider.invalidate(.type(TestUser.self), refetch: nil)
+        await client.settle()
+        #expect(client.state.isStale)
+        #expect(await server.fetchCount == fetches)
+        _ = subscription
+    }
+
+    @Test("invalidate with refetch .inactive fetches stored keys without a client")
+    func invalidateInactive() async throws {
+        let (provider, _, server) = try makeProvider()
+        await provider.waitForGarbageCollection()
+        let stored = QueryRecord.Key.make(TestDetail(id: "3"))
+        let context = ModelContext(provider.modelContainer)
+        context.insert(QueryRecord(
+            key: stored, stateData: try JSONEncoder().encode(TestDetail.QueryData(version: 0)),
+            lastSyncedAt: .now, tags: QueryRecord.Tags.encode(["users"])
+        ))
+        try context.save()
+
+        await provider.invalidate(.tag("users"), refetch: .inactive)
+        #expect(await server.fetchCount == 1)
+        #expect(try record(provider, stored)?.invalidated == false)
+        #expect(provider.getQueryState(for: TestDetail(id: "3")).isStale == false)
+    }
+
+    @Test("refetch waits for a fetch in flight, then sends a new request")
+    func refetchAfterInFlight() async throws {
+        let (provider, client, server) = try makeProvider()
+        let subscription = await observe(client)
+        await server.checkpoints.hold("fetch")
+        client.sync(.forever(refreshAfter: .zero))
+        await server.checkpoints.reached("fetch", count: 2)
+
+        let refetch = Task { await provider.refetch(.type(TestUser.self)) }
+        for _ in 0..<50 { await Task.yield() }
+        await server.checkpoints.release("fetch")
+        await refetch.value
+        #expect(await server.fetchCount == 3)
+        _ = subscription
+    }
+
+    @Test("reset waits for keys shown in a view to fetch again")
+    func resetWaits() async throws {
+        let (provider, client, server) = try makeProvider()
+        let subscription = await observe(client)
+
+        await provider.reset(.type(TestUser.self))
+        #expect(client.data == .init(etag: 2))
+        #expect(await server.fetchCount == 2)
+        _ = subscription
     }
 
     // MARK: Eviction and garbage collection
@@ -222,6 +299,56 @@ struct FetcherTests {
         #expect(!keys.contains { $0.contains("renamed") })
     }
 
+    @Test("A client created while its key is being evicted waits for the eviction")
+    func clientWaitsForEviction() async throws {
+        let container = try makeContainer()
+        let provider = QueryProvider(modelContainer: container, contexts: TestUser.Context(server: FakeServer()), fetchers: TestSlowEvict.self)
+        await provider.waitForGarbageCollection()
+        let key = TestSlowEvict()
+        let context = ModelContext(container)
+        context.insert(TestProfile(userID: "slow", bio: "old"))
+        context.insert(QueryRecord(key: QueryRecord.Key.make(key), stateData: try JSONEncoder().encode(41), lastSyncedAt: .now))
+        try context.save()
+
+        let removal = Task { await provider.remove(.type(TestSlowEvict.self)) }
+        await eventually { EvictLatch.shared.hasEntered }
+        let client = provider.client(for: key)
+        #expect(client.state.isPending)
+        let query = Task { try await provider.query(key, staleTime: .infinite) }
+        for _ in 0..<50 { await Task.yield() }
+        EvictLatch.shared.release()
+        await removal.value
+
+        // The fetch ran after the eviction, so its row survives and its data is fresh.
+        #expect(try await query.value == 1)
+        let bios = try ModelContext(container).fetch(FetchDescriptor<TestProfile>()).map(\.bio)
+        #expect(bios == ["fetched"])
+    }
+
+    @Test("One type's failing evict doesn't keep other keys removed with it")
+    func batchEvictFailure() async throws {
+        let container = try makeContainer()
+        let server = FakeServer()
+        let provider = QueryProvider(
+            modelContainer: container,
+            contexts: TestUser.Context(server: server), TestNote.Context(server: server),
+            fetchers: TestNote.self, TestDetail.self
+        )
+        await provider.waitForGarbageCollection()
+        let detail = QueryRecord.Key.make(TestDetail(id: "1"))
+        let context = ModelContext(container)
+        context.insert(TestProfile(userID: "1", bio: "Ada"))
+        context.insert(QueryRecord(key: detail, stateData: Data("{}".utf8), lastSyncedAt: .now))
+        context.insert(QueryRecord(key: TestNote.queryKey, stateData: Data("{}".utf8), lastSyncedAt: .now))
+        try context.save()
+
+        await provider.remove(.all)
+        let fresh = ModelContext(container)
+        #expect(try fresh.fetch(QueryRecord.descriptor(key: detail)).isEmpty)
+        #expect(try fresh.fetch(FetchDescriptor<TestProfile>()).isEmpty)
+        #expect(try fresh.fetch(QueryRecord.descriptor(key: TestNote.queryKey)).first?.stateData == nil)
+    }
+
     // MARK: Provider methods
 
     @Test("state(for:) reads stored state without creating a client")
@@ -247,7 +374,7 @@ struct FetcherTests {
         #expect(try await provider.query(key, staleTime: .infinite) == 1)
         #expect(try await provider.query(key, staleTime: .after(.zero)) == 2)
 
-        provider.invalidate(.key(key))
+        await provider.invalidate(.key(key))
         #expect(try await provider.query(key, staleTime: .infinite) == 3)
         #expect(await rates.requests.count == 3)
     }
@@ -287,7 +414,7 @@ struct FetcherTests {
 
         let query = Task { try await provider.query(key, staleTime: .after(.zero)) }
         await rates.checkpoints.reached("rate", count: 2)
-        provider.cancel(.type(TestStoredRate.self))
+        await provider.cancel(.type(TestStoredRate.self))
         await provider.client(for: key).settleOperations()
         await rates.checkpoints.release("rate")
 
@@ -356,7 +483,7 @@ struct FetcherTests {
         await server.checkpoints.hold("fetch")
         client.sync(.forever(refreshAfter: .zero))
         await server.checkpoints.reached("fetch", count: 2)
-        provider.cancel(.type(TestUser.self))
+        await provider.cancel(.type(TestUser.self))
         await server.checkpoints.reached("fetch-cancelled")
         await server.checkpoints.release("fetch")
         await client.settle()
@@ -425,7 +552,7 @@ struct FetcherTests {
         subscription.activate(client, cache: .swr(staleTime: .seconds(3600), gcTime: .seconds(7)))
         await client.settle()
 
-        provider.invalidate(.type(TestUser.self))
+        await provider.invalidate(.type(TestUser.self))
         await client.settleOperations()
         await client.settle()
         #expect(try record(provider, TestUser.queryKey)?.gcTime == 7)

@@ -421,20 +421,22 @@ Each of these also accepts a model type, such as `provider.getQueryState(for: Po
 
 ## Invalidating and Refreshing
 
-Invalidating marks data as stale. Views showing it fetch again right away, and other data is fetched the next time it's used. Data an optimistic mutation is still changing waits until that mutation finishes, so the change isn't overwritten.
+Invalidating marks data as stale. Views showing it fetch again right away, and `invalidate` waits for those fetches; other data is fetched the next time it's used. A fetch already in progress may have started before the change, so it's followed by a new one. Data an optimistic mutation is still changing waits until that mutation finishes, so the change isn't overwritten.
 
 You pick which data with filters:
 
 ```swift
-client.invalidate()                                   // the data behind this client
-provider.invalidate(.key(UserDetail(id: "42")))       // one fetcher value
-provider.invalidate(.key(postsClient))                // the data behind a client
-provider.invalidate(.type(UserDetail.self))           // every UserDetail
-provider.invalidate(.type(Post.self))                 // the Post collection
-provider.invalidate(.tag("users"))                    // everything tagged "users"
-provider.invalidate(.all)                             // everything
-provider.invalidate(.tag("users"), .type(Post.self))  // several at once
+client.invalidate()                                         // the data behind this client
+await provider.invalidate(.key(UserDetail(id: "42")))       // one fetcher value
+await provider.invalidate(.key(postsClient))                // the data behind a client
+await provider.invalidate(.type(UserDetail.self))           // every UserDetail
+await provider.invalidate(.type(Post.self))                 // the Post collection
+await provider.invalidate(.tag("users"))                    // everything tagged "users"
+await provider.invalidate(.all)                             // everything
+await provider.invalidate(.tag("users"), .type(Post.self))  // several at once
 ```
+
+Pass `refetch:` to choose what fetches right away: `.active` (the default) for data shown in a view, `.inactive` for everything else including data saved earlier, `.all` for both, or `nil` to only mark it stale. From synchronous code such as a button action, wrap the call in a `Task`.
 
 Tags group data that changes together. Give models and fetchers tags with `tags`:
 
@@ -453,10 +455,12 @@ The provider's other operations take the same filters:
 | Operation | What it does |
 |---|---|
 | `invalidate` | Marks data as stale; shown data is fetched again |
-| `refetch` | Fetches now |
+| `refetch` | Fetches now, without marking anything stale |
 | `cancel` | Stops fetches in progress and keeps the previous data |
 | `remove` | Stops fetches in progress, then deletes the data, running `evict` |
 | `reset` | Removes the data, then fetches it again for views showing it |
+
+All of them are `async`. `invalidate`, `refetch` and `reset` return once their fetches finish, and like `invalidate`, `refetch` follows a fetch already in progress with a new one. A failed fetch is reported by its client; none of these throw. Work on saved data that nothing is using, such as marking it stale or deleting it, runs in the background, so a large `remove(.all)` doesn't block the UI.
 
 `refetch` fetches data shown in a view. Pass `type: .inactive` to fetch the rest instead, including data saved earlier that nothing has used yet, or `type: .all` for both:
 

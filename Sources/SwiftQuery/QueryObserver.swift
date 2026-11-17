@@ -54,6 +54,8 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
         modelContainer: ModelContainer,
         fetchContext: Fetcher.Context,
         provider: QueryProvider,
+        gate: Task<Void, Never>? = nil,
+        initialLoad: InitialLoad = .stored,
         onEvict: @escaping QueryActor<Fetcher>.EvictHandler = { _, _ in }
     ) {
         let sink = SnapshotSink<Fetcher>()
@@ -70,7 +72,19 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
             onEvict: onEvict
         )
         sink.client = self
-        loadInitialState()
+        // Operations wait for store work on this key that was still running at creation.
+        tail = gate
+        loadInitialState(initialLoad)
+    }
+
+    /// How a new client fills ``state`` before its first sync.
+    enum InitialLoad {
+        /// From the stored record.
+        case stored
+        /// From the stored record, marked stale: an invalidation of the key is being saved.
+        case storedStale
+        /// Not at all: the key's record is being evicted.
+        case skip
     }
 
     /// Whether a view observes the client, or a fetch or mutation is running.
@@ -254,13 +268,19 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
         await actor.setQueryData(data)
     }
 
+    /// Cancels the in-flight fetch once the operations already queued have run.
+    func cancelFetch() async {
+        await tail?.value
+        await actor.cancelFetch()
+    }
+
     /// Removes the key's data. Returns whether it was evicted.
     func remove() async -> Bool {
         await tail?.value
         return await actor.remove()
     }
 
-    /// Syncs again if a view still shows the key, waiting until any fetch has started.
+    /// Syncs again if a view still shows the key, waiting for any fetch it starts to finish.
     func resyncIfObserved() async {
         await tail?.value
         await actor.resyncIfObserved()
@@ -346,12 +366,12 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
     }
 
     /// Reads persisted metadata synchronously so views don't flash `.pending` on launch.
-    private func loadInitialState() {
-        guard fetcher.cache != nil,
+    private func loadInitialState(_ load: InitialLoad) {
+        guard load != .skip, fetcher.cache != nil,
               let (value, data, stale) = Self.storedState(fetcher, key: recordKey, in: modelContainer.mainContext)
         else { return }
         stateData = data
-        state = .success(data: value, stale: stale)
+        state = .success(data: value, stale: stale || load == .storedStale)
     }
 
     /// Decodes a key's stored state, if it has usable state.
@@ -402,6 +422,7 @@ protocol AnyQueryObserver: AnyObject {
     func deferFetch()
     func release() async -> Bool
     func cancel()
+    func cancelFetch() async
     func unsubscribe()
     func remove() async -> Bool
     func resyncIfObserved() async

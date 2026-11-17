@@ -416,3 +416,46 @@ struct TestCounted: QueryFetcher {
         CountedValue(value: 1)
     }
 }
+
+/// Holds ``TestSlowEvict``'s `evict` until a test releases it. Blocks the calling thread, so
+/// only the record store's work waits.
+final class EvictLatch: @unchecked Sendable {
+    static let shared = EvictLatch()
+    private let condition = NSCondition()
+    private var entered = false
+    private var released = false
+
+    var hasEntered: Bool { condition.withLock { entered } }
+
+    func pass() {
+        condition.lock()
+        entered = true
+        while !released {
+            condition.wait()
+        }
+        condition.unlock()
+    }
+
+    func release() {
+        condition.withLock {
+            released = true
+            condition.broadcast()
+        }
+    }
+}
+
+/// A persisted fetcher that writes a row, and whose `evict` waits for ``EvictLatch`` before
+/// deleting it.
+struct TestSlowEvict: QueryFetcher {
+    var cache: QueryCache? { .forever() }
+
+    func fetch(context: ModelContext, fetchContext: Void, previous: Int?) async throws -> Int {
+        context.insert(TestProfile(userID: "slow", bio: "fetched"))
+        return (previous ?? 0) + 1
+    }
+
+    func evict(context: ModelContext) throws {
+        EvictLatch.shared.pass()
+        try context.delete(model: TestProfile.self, where: #Predicate { $0.userID == "slow" })
+    }
+}
