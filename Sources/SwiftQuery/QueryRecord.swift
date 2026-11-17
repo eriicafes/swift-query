@@ -128,7 +128,9 @@ extension QueryRecord {
         }
 
         static func decode(_ string: String) -> Set<String> {
-            Set(string.split(separator: ",").map { unescape(String($0)) })
+            // `,a,b,` splits into "", "a", "b", ""; keeping empty pieces keeps an empty tag (`,,`).
+            let pieces = string.split(separator: ",", omittingEmptySubsequences: false).dropFirst().dropLast()
+            return Set(pieces.map { unescape(String($0)) })
         }
 
         static func needle(_ tag: String) -> String {

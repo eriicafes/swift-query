@@ -394,6 +394,101 @@ struct ProviderMutationTests {
         }
     }
 
+    @Test("A skipped rollback runs after a newer overlapping mutation's if that one fails too")
+    func handedOffRollback() async throws {
+        let (provider, users, server) = try await loaded(observed: false)
+        await server.checkpoints.hold("rename:First")
+
+        let first = Task {
+            try await provider.mutate(scope: "s", {
+                try await server.rename(id: "1", to: "First", fail: true)
+            }, optimistic: renameRow("1", to: "First"))
+        }
+        await server.checkpoints.reached("rename:First")
+        let second = Task {
+            try await provider.mutate(scope: "s", {
+                try await server.rename(id: "1", to: "Second", fail: true)
+            }, optimistic: renameRow("1", to: "Second"))
+        }
+        await eventually { (try? localUsers(users)["1"]) == "Second" }
+        await server.checkpoints.release("rename:First")
+        await #expect(throws: ServerError.self) { try await first.value }
+        // The newer edit stays while its call is in flight.
+        #expect(try localUsers(users)["1"] == "Second")
+        await #expect(throws: ServerError.self) { try await second.value }
+        // Both failed and nothing refetches here, so both rollbacks ran, newest first.
+        #expect(try localUsers(users)["1"] == "Ada")
+    }
+
+    @Test("A skipped rollback is dropped when the newer overlapping mutation succeeds")
+    func droppedRollback() async throws {
+        let (provider, users, server) = try await loaded(observed: false)
+        await server.checkpoints.hold("rename:First")
+
+        let first = Task {
+            try await provider.mutate(scope: "s", {
+                try await server.rename(id: "1", to: "First", fail: true)
+            }, optimistic: renameRow("1", to: "First"))
+        }
+        await server.checkpoints.reached("rename:First")
+        let second = Task {
+            try await provider.mutate(scope: "s", {
+                try await server.rename(id: "1", to: "Second")
+            }, optimistic: renameRow("1", to: "Second"))
+        }
+        await eventually { (try? localUsers(users)["1"]) == "Second" }
+        await server.checkpoints.release("rename:First")
+        await #expect(throws: ServerError.self) { try await first.value }
+        _ = try await second.value
+        #expect(try localUsers(users)["1"] == "Second")
+    }
+
+    @Test("Query data edited twice in one failed update is fully restored")
+    func dataRollbackOrder() async throws {
+        let (provider, _, server) = try await loaded(observed: false)
+        let key = TestDetail(id: "1")
+        await provider.client(for: key).refresh()
+        let before = try #require(provider.getQueryData(for: key))
+        await server.checkpoints.hold("rename:x")
+
+        let mutation = Task {
+            try await provider.mutate({
+                try await server.rename(id: "1", to: "x", fail: true)
+            }, optimistic: { tx in
+                tx.setQueryData(for: key) { $0.version += 10 }
+                tx.setQueryData(for: key) { $0.version += 100 }
+            })
+        }
+        await server.checkpoints.reached("rename:x")
+        // Both edits are stored before the call fails.
+        await provider.client(for: key).settleOperations()
+        #expect(provider.getQueryData(for: key)?.version == before.version + 110)
+        await server.checkpoints.release("rename:x")
+        await #expect(throws: ServerError.self) { try await mutation.value }
+        #expect(provider.getQueryData(for: key) == before)
+    }
+
+    @Test("An optimistic update that throws refetches the query data it changed")
+    func throwingUpdateRefetches() async throws {
+        let (provider, _, server) = try await loaded(observed: false)
+        let key = TestDetail(id: "1")
+        let detail = provider.client(for: key)
+        detail.attach(nil)
+        await detail.settle()
+        let fetches = await server.fetchCount
+
+        #expect(throws: ServerError.self) {
+            try provider.beginMutation(scope: nil, invalidates: [], optimistic: { tx in
+                tx.setQueryData(for: key) { $0.version += 10 }
+                throw ServerError()
+            })
+        }
+        await eventually { await server.fetchCount == fetches + 1 }
+        await detail.settle()
+        #expect(detail.state.isStale == false)
+        detail.detach()
+    }
+
     @Test("Unscoped calls through one mutation observer roll back independently")
     func observerCallsRollBackIndependently() async throws {
         let (provider, users, server) = try await loaded(observed: false)

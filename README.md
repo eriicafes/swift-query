@@ -106,18 +106,18 @@ final class Post {
 extension Post: QueryModel {
     static var cache: QueryCache { .swr(staleTime: .seconds(60)) }
 
-    static func fetch(context: ModelContext, fetchContext: API, previous: Date?) async throws -> Date {
-        for dto in try await fetchContext.posts() {
-            context.insert(Post(id: dto.id, title: dto.title)) // upserts by unique id
+    static func fetch(query: QueryFetch<API, Date>) async throws -> Date {
+        for dto in try await query.context.posts() {
+            query.modelContext.insert(Post(id: dto.id, title: dto.title)) // upserts by unique id
         }
         return .now
     }
 }
 ```
 
-- `context` is a fresh `ModelContext` for this fetch. Changes are saved when `fetch` returns, and thrown away if it throws.
-- `fetchContext` is the dependency from `contexts:`, found by its type. Here it's the `API` registered earlier.
-- `fetch` returns a small piece of data that SwiftQuery stores for you, called the query data. The next fetch receives it back as `previous`. This example has nothing to remember, so it returns the time it fetched. The next sections show query data that matters, such as an ETag.
+- `query.modelContext` is a fresh `ModelContext` for this fetch. Changes are saved when `fetch` returns, and thrown away if it throws.
+- `query.context` is the dependency from `contexts:`, found by its type. The first type in `QueryFetch<API, Date>` says which type; here it's the `API` registered earlier. The second is the type `fetch` returns.
+- `fetch` returns a small piece of data that SwiftQuery stores for you, called the query data. Its type is inferred from the return type. The next fetch receives it back as `query.previous`. This example has nothing to remember, so it returns the time it fetched. The next sections show query data that matters, such as an ETag.
 - `cache` decides how long the data stays fresh. See [Caching](#caching).
 
 ### 3. Show it in a view
@@ -143,7 +143,7 @@ struct PostsView: View {
 
 ## Fetch Dependencies
 
-A fetch usually has dependencies, such as a URL session, a socket, credentials or settings. You pass them to the provider in `contexts:`, and each fetch receives the one whose type matches its `fetchContext` parameter.
+A fetch usually has dependencies, such as a URL session, a socket, credentials or settings. You pass them to the provider in `contexts:`, and each fetch receives the one whose type matches its `Context` as `query.context`.
 
 ```swift
 struct API: Sendable {
@@ -152,7 +152,7 @@ struct API: Sendable {
 
 QueryProvider(modelContainer: container, contexts: API(), fetchers: Post.self)
 
-// Post.fetch(context:fetchContext:previous:) declares `fetchContext: API`, so it receives this API.
+// Post's fetch takes `QueryFetch<API, Date>`, so it receives this API as `query.context`.
 ```
 
 A fetch can ask for any `Sendable` type, and several models can ask for the same type and share one value. When a fetch needs several things, group them in a struct:
@@ -164,7 +164,7 @@ extension Message: QueryModel {
         let socket: Socket
     }
 
-    static func fetch(context: ModelContext, fetchContext: Context, previous: Cursor?) async throws -> Cursor { ... }
+    static func fetch(query: QueryFetch<Context, Cursor>) async throws -> Cursor { ... }
 }
 
 QueryProvider(
@@ -174,7 +174,7 @@ QueryProvider(
 )
 ```
 
-To depend on a protocol rather than a concrete type, for example so tests can pass a fake, declare the parameter with the protocol and cast the value when you register it:
+To depend on a protocol rather than a concrete type, for example so tests can pass a fake, use the protocol as the context type and cast the value when you register it:
 
 ```swift
 protocol PostsService: Sendable {
@@ -184,7 +184,7 @@ protocol PostsService: Sendable {
 struct LivePostsService: PostsService { ... }
 
 extension Post: QueryModel {
-    static func fetch(context: ModelContext, fetchContext: any PostsService, previous: Date?) async throws -> Date { ... }
+    static func fetch(query: QueryFetch<any PostsService, Date>) async throws -> Date { ... }
 }
 
 QueryProvider(
@@ -199,7 +199,7 @@ Without the cast, the value would be registered as `LivePostsService` and the fe
 Some dependencies need no registration:
 
 - A type that conforms to `DefaultFetchContext` (which requires an empty `init()`) is created by the provider when nothing is registered for it.
-- A fetch that needs nothing can declare `fetchContext: Void`.
+- A fetch that needs nothing can take `Void` as its context: `QueryFetch<Void, Date>`.
 
 The provider checks at launch that every type in `fetchers:` can find its dependency, and stops with a message naming the missing type if one can't.
 
@@ -259,8 +259,8 @@ struct UserDetail: QueryFetcher {
 
     var cache: QueryCache? { .swr(staleTime: .seconds(30)) }
 
-    func fetch(context: ModelContext, fetchContext: API, previous: Date?) async throws -> Date {
-        let dto = try await fetchContext.user(id: id)
+    func fetch(query: QueryFetch<API, Date>) async throws -> Date {
+        let dto = try await query.context.user(id: id)
         // create or update the User row for dto
         return .now
     }
@@ -307,8 +307,8 @@ struct ExchangeRate: QueryFetcher {
 
     var cache: QueryCache? { .swr(staleTime: .seconds(60)) }
 
-    func fetch(context: ModelContext, fetchContext: API, previous: Double?) async throws -> Double {
-        try await fetchContext.rate(from: from, to: to)
+    func fetch(query: QueryFetch<API, Double>) async throws -> Double {
+        try await query.context.rate(from: from, to: to)
     }
 }
 
@@ -327,7 +327,7 @@ The value is saved in SwiftQuery's own `QueryRecord` model, so it's available on
 
 ### Query data across fetches
 
-`previous` lets a fetch build on the last one. A common use is an ETag, so the server can answer "not modified":
+`query.previous` lets a fetch build on the last one. A common use is an ETag, so the server can answer "not modified":
 
 ```swift
 extension Post: QueryModel {
@@ -337,32 +337,34 @@ extension Post: QueryModel {
 
     static var cache: QueryCache { .swr(staleTime: .seconds(60)) }
 
-    static func fetch(context: ModelContext, fetchContext: API, previous: QueryData?) async throws -> QueryData {
-        let response = try await fetchContext.posts(etag: previous?.etag)
+    static func fetch(query: QueryFetch<API, QueryData>) async throws -> QueryData {
+        let response = try await query.context.posts(etag: query.previous?.etag)
         guard let posts = response.posts else {
-            return previous ?? QueryData() // 304 Not Modified: keep everything
+            return query.previous ?? QueryData() // 304 Not Modified: keep everything
         }
         for dto in posts {
-            context.insert(Post(id: dto.id, title: dto.title))
+            query.modelContext.insert(Post(id: dto.id, title: dto.title))
         }
         return QueryData(etag: response.etag)
     }
 }
 ```
 
-`previous` is `nil` before the first successful fetch. The same pattern works for cursors and page tokens.
+`query.previous` is `nil` before the first successful fetch. The same pattern works for cursors and page tokens.
 
 ## Cleaning Up
 
-With `.swr`, data that goes unused for `gcTime` is removed. Your rows are your own data, so by default SwiftQuery only forgets its bookkeeping and the next view fetches again. To delete rows too, implement `evict(context:)`:
+With `.swr`, data that goes unused for `gcTime` is removed. Your rows are your own data, so by default SwiftQuery only forgets its bookkeeping and the next view fetches again. To delete rows too, implement `evict(query:)`:
 
 ```swift
 extension Post: QueryModel {
-    static func evict(context: ModelContext) throws {
-        try context.delete(model: Post.self)
+    static func evict(query: QueryEvict<API>) throws {
+        try query.modelContext.delete(model: Post.self)
     }
 }
 ```
+
+`query.context` is the same dependency `fetch` gets, for cleanup that needs it, such as a file cache directory.
 
 Only delete rows that came from the server and that nothing else shows.
 
@@ -473,7 +475,7 @@ A single client offers the same for its own data: `client.sync()` fetches if sta
 
 When data is removed, everything that shares a tag with it is invalidated, so details refetch after the list they belong to is removed. Keys removed together don't count: `remove(.tag("users"))` doesn't refetch any of the keys it removes.
 
-A cancelled fetch never saves the rows it left in `context`. Rows a fetcher saved itself before it was cancelled stay, except when it was cancelled by `remove` or `reset`: those wait for the fetch to stop, then evict. So a fetcher that saves on its own should check for cancellation first, with `try Task.checkCancellation()`.
+A cancelled fetch never saves the rows it left in `query.modelContext`. Rows a fetcher saved itself before it was cancelled stay, except when it was cancelled by `remove` or `reset`: those wait for the fetch to stop, then evict. So a fetcher that saves on its own should check for cancellation first, with `try Task.checkCancellation()`.
 
 ## Mutations
 
@@ -523,7 +525,7 @@ try await profileClient.mutate {
 ```
 
 - If the request succeeds, the changes stay until the data is fetched again.
-- If it fails, the undo closures run (newest first), query data is put back, and the error is thrown to you. Query data is only put back if nothing, such as a fetch, has changed it since. If a newer optimistic mutation may have changed the same data since, the undo closures are skipped so they can't undo the newer change, and the data is fetched again instead. A newer mutation counts when it's in the same scope or invalidates overlapping data: the same key or type, or any tag or `.all`. A mutation that invalidates nothing only counts through its scope.
+- If it fails, the undo closures run (newest first), query data is put back, and the error is thrown to you. Query data is only put back if nothing, such as a fetch, has changed it since. If a newer optimistic mutation may have changed the same data since, the undo closures don't run now, so they can't undo the newer change. While the newer one's request is in flight, they wait for it: if it fails too, they run after its own; if it succeeds, they're dropped. Either way the data is fetched again. A newer mutation counts when it's in the same scope or invalidates overlapping data: the same key or type, or any tag or `.all`. A mutation that invalidates nothing only counts through its scope.
 - `setQueryData` stops a fetch of that data in progress, so an older response can't overwrite the change, and the data is invalidated when the mutation finishes. A `provider.query` waiting on that fetch gets the updated value.
 - While the request is in flight, the data it invalidates isn't fetched by views or by other mutations finishing, so the server's older data can't overwrite the change. Pull-to-refresh and `provider.query` still fetch.
 - Once a request is sent, cancelling the task that called `mutate` doesn't cancel it.
@@ -615,7 +617,7 @@ final class ProfileModel {
 
 ## Subscribe
 
-Some data arrives continuously, such as chat messages over a socket. Implement `subscribe` to keep receiving updates while a view shows the data. It returns a task that runs until it's cancelled:
+Some data arrives continuously, such as chat messages over a socket. Implement `subscribe` to keep receiving updates while a view shows the data. It runs until the stream ends:
 
 ```swift
 extension Message: QueryModel {
@@ -623,33 +625,52 @@ extension Message: QueryModel {
         var lastSeq = 0
     }
 
-    static func subscribe(
-        container: ModelContainer,
-        fetchContext: Context,
-        previous: QueryData?,
-        writer: QueryDataWriter<QueryData>
-    ) -> Task<Void, Never>? {
-        Task {
-            let context = ModelContext(container)
-            for await event in await fetchContext.socket.messages(after: previous?.lastSeq ?? 0) {
-                context.insert(Message(event))
-                try? context.save()
-                await writer.update { $0.lastSeq = max($0.lastSeq, event.seq) }
+    static func subscribe(query: QuerySubscription<Context, QueryData>) async throws {
+        let socket = try await query.context.socket.connect()
+        let writer = await query.begin()
+        for try await event in socket.messages {
+            try await writer.write { tx in
+                guard event.seq > (tx.data?.lastSeq ?? 0) else { return } // the fetch already has it
+                tx.modelContext.insert(Message(event))
+                tx.data?.lastSeq = event.seq
             }
         }
     }
 }
 ```
 
-- `subscribe` is called when a view shows the data. Its task is cancelled a few minutes after the last such view goes away. The delay is 5 minutes by default; change it with the provider's `keepAliveTime:` argument.
-- `subscribe` should only create and return the task. Do any waiting inside it.
-- `writer.update` changes the saved query data, so the next `fetch` continues after the last update the task received instead of downloading it again.
+- `subscribe` is called when a view shows the data. It's cancelled a few minutes after the last such view goes away. The delay is 5 minutes by default; change it with the provider's `keepAliveTime:` argument.
+- `query.begin()` starts a fetch and returns the writer. Writes wait until that fetch has succeeded, then see its rows and data, so they can skip events it already brought in. A view's first sync doesn't fetch on its own; `begin()` does, so the stream costs one fetch.
+- Call `begin()` after connecting if the stream can't resume from a cursor, so the fetch covers everything sent before the connection. A stream that resumes from `query.previous`, or sends its own snapshot, can call it before connecting.
+- Set a connect timeout. Until `begin()` is called the data isn't fetched, so a connect that hangs would leave it unfetched; one that times out throws, which fetches at once.
+- Write rows and query data only through `writer.write`. It runs on the key's actor, and saves both together, so a fetch never lands in the middle of a write or overwrites it while it runs. Keep the closure short, and apply several events in one write when the stream is busy, since each write saves.
+- While a write waits, your loop doesn't read the next event, so events wait in your socket or stream instead of piling up in SwiftQuery.
+- Return or throw when the stream drops, without reconnecting yourself. While a view shows the data, `subscribe` is called again after a short backoff, and its `begin()` fetches what was missed.
+- Returning without calling `begin()` means there are no live updates; the data is fetched as usual.
+- While the stream is synced, the data isn't refetched when it goes stale, because the stream keeps it current. Set `refetchWhileSubscribed` to `true` to refetch anyway. Invalidating always refetches.
+- If the fetch from `begin()` fails, it's retried with a backoff, and writes keep waiting. Once synced, a failed refetch doesn't hold writes back.
+- `remove` and `reset` cancel the stream and wait for it to stop, so respect cancellation.
+
+To handle events yourself while a fetch runs, write with `.now`. It runs right away, and `tx.isSynced` says whether a fetch is still pending, for example to keep events in your own buffer and apply them once `writer.synced()` returns:
+
+```swift
+let applied = try await writer.write(.now) { tx in
+    guard tx.isSynced else { return false }
+    tx.modelContext.insert(Message(event))
+    return true
+}
+if !applied { buffer.append(event) }
+```
+
+A fetch that finishes after a `.now` write wins: rows it saves and the data it returns replace what the write stored. Rows only the write touched stay.
+
+If an optimistic mutation's request fails after a stream wrote the same row, its rollback overwrites the stream's change. The mutation's `invalidates:` refetch then brings the row up to date.
 
 ## Concurrency
 
-`fetch` and the task returned by `subscribe` run in the background, off the main actor. Waiting for the network doesn't block the UI either way, but the work around it would: decoding a large response, creating and updating many models, and saving them to the store. Running in the background keeps that work from causing dropped frames.
+`fetch` and `subscribe` run in the background, off the main actor. Waiting for the network doesn't block the UI either way, but the work around it would: decoding a large response, creating and updating many models, and saving them to the store. Running in the background keeps that work from causing dropped frames.
 
-Each fetch gets its own `ModelContext`, and the task returned by `subscribe` creates its own from `container`. SwiftData requires a context to be used from one place at a time, and these never leave their `fetch` or task. Saving them updates the main context, so `@Query` sees the changes.
+Each fetch gets its own `ModelContext`, and so does each of a stream's writes. SwiftData requires a context to be used from one place at a time, and these never leave their `fetch` or write. Saving them updates the main context, so `@Query` sees the changes.
 
 ### Main-actor default isolation
 
@@ -707,9 +728,9 @@ final class Post {
 extension Post: QueryModel {
     static var cache: QueryCache { .swr(staleTime: .seconds(60)) }
 
-    static func fetch(context: ModelContext, fetchContext: API, previous: Date?) async throws -> Date {
-        for dto in try await fetchContext.posts() {
-            context.insert(Post(id: dto.id, title: dto.title)) // upserts by unique id
+    static func fetch(query: QueryFetch<API, Date>) async throws -> Date {
+        for dto in try await query.context.posts() {
+            query.modelContext.insert(Post(id: dto.id, title: dto.title)) // upserts by unique id
         }
         return .now
     }

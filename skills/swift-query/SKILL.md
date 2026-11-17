@@ -1,6 +1,6 @@
 ---
 name: swift-query
-description: Use when syncing SwiftData or other remote data with external APIs using SwiftQuery. Covers QueryModel, QueryFetcher, Context, QueryData, QueryCache, QueryProvider contexts and fetchers, @QueryClient, QueryObserver, subscribe and QueryDataWriter, QueryFilter and bulk operations, query/getQueryState/getQueryData/setQueryData, mutations with @MutationClient, client.mutate and provider.mutate, and optimistic updates.
+description: Use when syncing SwiftData or other remote data with external APIs using SwiftQuery. Covers QueryModel, QueryFetcher, Context, QueryData, QueryCache, QueryProvider contexts and fetchers, @QueryClient, QueryObserver, subscribe and QueryWriter, QueryFilter and bulk operations, query/getQueryState/getQueryData/setQueryData, mutations with @MutationClient, client.mutate and provider.mutate, and optimistic updates.
 ---
 
 # SwiftQuery
@@ -23,22 +23,22 @@ Pick the conformance:
 - `QueryModel` (static members) when a fetch syncs a whole collection. The model type is the key.
 - `QueryFetcher` (a `Hashable`, `Codable` struct with instance members) for anything else. Each fetcher value is its own key, for example `UserDetail(id:)`. Keep the synthesized `Hashable` and `Codable` conformances.
 
-Keep the `@Model` class to application data and put the conformance in a separate extension. `Context` and `QueryData` are inferred from `fetch`; name them only when the type needs nesting (`struct QueryData: Codable { var etag: String? }`). `fetch` receives the stored data as `previous` (`nil` before the first success) and returns the new data, so `QueryData` is never optional: a data fetcher returns its data, such as `-> Double`.
+Keep the `@Model` class to application data and put the conformance in a separate extension. Signatures are `fetch(query: QueryFetch<Context, QueryData>) async throws -> QueryData`, `subscribe(query: QuerySubscription<Context, QueryData>) async throws` and `evict(query: QueryEvict<Context>) throws`, with `static` on models, for example `fetch(query: QueryFetch<API, Date>) async throws -> Date`. Both types are inferred from `fetch`: `Context` is the dependency's type (nest `struct Context` when it needs several values), and `QueryData` is the return type, nested when it needs fields (`struct QueryData: Codable { var etag: String? }`). `query.modelContext` is SwiftData, `query.context` the dependency, and `query.previous` the stored data (`nil` before the first success). `fetch` returns the new data, so `QueryData` is never optional: a data fetcher returns its data, such as `-> Double`. `QueryData` must be `Sendable`, which internal structs of `Sendable` values are automatically.
 
 In `fetch`:
 
-- Write rows into the provided `context`. The context is fresh per fetch. Pending changes are saved when `fetch` returns, and discarded if it throws or was cancelled. If `fetch` saves `context` itself, call `try Task.checkCancellation()` first.
-- Read cursors or ETags from `previous?` and return the new data. It is saved once, after `fetch` returns successfully. On a 304, return `previous`.
+- Write rows into `query.modelContext`. The context is fresh per fetch. Pending changes are saved when `fetch` returns, and discarded if it throws or was cancelled. If `fetch` saves the context itself, call `try Task.checkCancellation()` first.
+- Read cursors or ETags from `query.previous?` and return the new data. It is saved once, after `fetch` returns successfully. On a 304, return `query.previous`.
 - On a 304 or other "no changes" response, don't touch rows.
 - If the app uses MainActor default isolation, mark the conformance extension `nonisolated`, and make the types `fetch` calls into (such as those in its fetch context) `nonisolated` too. Otherwise each call hops back to the main actor and does its work there.
 
-Implement `subscribe` only when the key needs live updates, such as from a socket. It must return a task without awaiting anything itself, create its own `ModelContext(container)`, and call `await writer.update { data in ... }` with monotonic changes such as `data.seq = max(data.seq, event.seq)`. Don't deduplicate connections yourself: the client runs at most one `subscribe` task, and only while a view shows the key.
+Implement `subscribe` only when the key needs live updates, such as from a socket. Connect, then `let writer = await query.begin()`, then for each event `try await writer.write { tx in ... }`: skip events the fetch already has (`guard event.seq > (tx.data?.seq ?? 0) else { return }`), write rows into `tx.modelContext` and data into `tx.data`. `begin()` starts the fetch that writes wait for; call it after connecting for a stream that can't resume, or before connecting for one that resumes from `query.previous`. Give the connect a timeout: until `begin()` is called the key doesn't fetch. Write rows and data only through `writer.write`, batch busy streams into fewer writes, and keep closures short. Return or throw when the stream drops; don't reconnect in a loop, since the library calls `subscribe` again with a backoff and refetches. Returning without `begin()` means no live updates. Use `write(.now)` with `tx.isSynced` only to buffer events yourself during a fetch. Don't deduplicate connections yourself: the client runs at most one stream, and only while a view shows the key.
 
 Pick the cache policy:
 
 - `.forever()` for data that only changes when the app says so (call `invalidate()`).
 - `.forever(refreshAfter:)` for data that should refresh periodically but never be dropped.
-- `.swr(staleTime:gcTime:)` for data that may be dropped after going unused. Expired data is cleaned up automatically at launch, when the app goes to the background, and when it's next used, so don't call `collectGarbage()` from scene-phase handlers. Implement `evict(context:)` to delete only server-owned rows. The default evicts nothing.
+- `.swr(staleTime:gcTime:)` for data that may be dropped after going unused. Expired data is cleaned up automatically at launch, when the app goes to the background, and when it's next used, so don't call `collectGarbage()` from scene-phase handlers. Implement `evict(query:)` to delete only server-owned rows from `query.modelContext`. The default evicts nothing.
 - For a fetcher, `nil` keeps the data in memory for the session only. Don't write rows from such a fetcher unless they hang off a model.
 
 Rows a fetcher writes should hang off a model through a `.cascade` relationship, such as `User.profile`. Give the model and its fetchers a shared tag, such as `"users"`, so evicting the collection invalidates the fetchers. A fetcher that inserts top-level rows must delete them in `evict`.

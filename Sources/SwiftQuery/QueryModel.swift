@@ -12,8 +12,8 @@ import SwiftData
 ///     static var cache: QueryCache { .forever(refreshAfter: .seconds(5 * 60)) }
 ///     static var tags: Set<String> { ["users"] }
 ///
-///     static func fetch(context: ModelContext, fetchContext: APIClient, previous: QueryData?) async throws -> QueryData {
-///         // fetch with previous?.etag, write into `context`
+///     static func fetch(query: QueryFetch<APIClient, QueryData>) async throws -> QueryData {
+///         // fetch with query.previous?.etag, write into query.modelContext
 ///         return QueryData(etag: newETag)
 ///     }
 /// }
@@ -22,7 +22,7 @@ public protocol QueryModel: PersistentModel, Queryable {
     /// Runtime dependencies, resolved by type from the provider's `contexts:`.
     associatedtype Context: Sendable
     /// Sync metadata such as ETags or cursors, persisted between launches.
-    associatedtype QueryData: Codable
+    associatedtype QueryData: Codable & Sendable
 
     /// The default cache policy. Models are always persisted.
     static var cache: QueryCache { get }
@@ -30,35 +30,26 @@ public protocol QueryModel: PersistentModel, Queryable {
     /// Tags for invalidating and removing groups of keys. Defaults to none.
     static var tags: Set<String> { get }
 
-    /// Fetches the collection into `context`. See ``QueryFetcher/fetch(context:fetchContext:previous:)``.
-    static func fetch(context: ModelContext, fetchContext: Context, previous: QueryData?) async throws -> QueryData
+    /// Whether the collection refetches on staleness while a subscription is synced. Defaults to
+    /// `false`. See ``QueryFetcher/refetchWhileSubscribed``.
+    static var refetchWhileSubscribed: Bool { get }
 
-    /// Subscribes to live updates. See ``QueryFetcher/subscribe(container:fetchContext:previous:writer:)``.
-    static func subscribe(
-        container: ModelContainer,
-        fetchContext: Context,
-        previous: QueryData?,
-        writer: QueryDataWriter<QueryData>
-    ) -> Task<Void, Never>?
+    /// Fetches the collection into `query.modelContext`. See ``QueryFetcher/fetch(query:)``.
+    static func fetch(query: QueryFetch<Context, QueryData>) async throws -> QueryData
+
+    /// Streams live updates. See ``QueryFetcher/subscribe(query:)``.
+    static func subscribe(query: QuerySubscription<Context, QueryData>) async throws
 
     /// Deletes the collection's server-owned rows when its SWR cache expires or is removed.
     /// Defaults to nothing, so locally owned data is never deleted implicitly.
-    static func evict(context: ModelContext) throws
+    static func evict(query: QueryEvict<Context>) throws
 }
 
 extension QueryModel {
     public static var tags: Set<String> { [] }
-
-    public static func subscribe(
-        container: ModelContainer,
-        fetchContext: Context,
-        previous: QueryData?,
-        writer: QueryDataWriter<QueryData>
-    ) -> Task<Void, Never>? {
-        nil
-    }
-
-    public static func evict(context: ModelContext) throws {}
+    public static var refetchWhileSubscribed: Bool { false }
+    public static func subscribe(query: QuerySubscription<Context, QueryData>) async throws {}
+    public static func evict(query: QueryEvict<Context>) throws {}
 }
 
 /// The fetcher for a ``QueryModel`` collection. `@QueryClient(User.self)` and
@@ -68,22 +59,18 @@ public struct ModelFetcher<Model: QueryModel>: QueryFetcher {
 
     public var cache: QueryCache? { Model.cache }
     public var tags: Set<String> { Model.tags }
+    public var refetchWhileSubscribed: Bool { Model.refetchWhileSubscribed }
 
-    public func fetch(context: ModelContext, fetchContext: Model.Context, previous: Model.QueryData?) async throws -> Model.QueryData {
-        try await Model.fetch(context: context, fetchContext: fetchContext, previous: previous)
+    public func fetch(query: QueryFetch<Model.Context, Model.QueryData>) async throws -> Model.QueryData {
+        try await Model.fetch(query: query)
     }
 
-    public func subscribe(
-        container: ModelContainer,
-        fetchContext: Model.Context,
-        previous: Model.QueryData?,
-        writer: QueryDataWriter<Model.QueryData>
-    ) -> Task<Void, Never>? {
-        Model.subscribe(container: container, fetchContext: fetchContext, previous: previous, writer: writer)
+    public func subscribe(query: QuerySubscription<Model.Context, Model.QueryData>) async throws {
+        try await Model.subscribe(query: query)
     }
 
-    public func evict(context: ModelContext) throws {
-        try Model.evict(context: context)
+    public func evict(query: QueryEvict<Model.Context>) throws {
+        try Model.evict(query: query)
     }
 }
 

@@ -88,6 +88,10 @@ struct OptimisticEntry {
     let id: UInt64
     let scope: AnyHashable?
     let filters: [QueryFilter]
+    /// The mutation while it runs, so an older one can hand it a rollback.
+    weak var run: MutationRun?
+    /// Whether its remote call succeeded, or `nil` until it's decided.
+    var succeeded: Bool?
 
     /// Whether this mutation may have edited what a mutation with `scope` and `filters` edited:
     /// it shares the scope, or their filters overlap. Mutations without filters overlap nothing
@@ -175,6 +179,9 @@ final class MutationRun {
     let gate: MutationGate?
     /// The key of the record marking this mutation as pending, if it has an optimistic update.
     let marker: String?
+    /// Rollbacks of older failed mutations that this one's edit covered, by mutation id. They run
+    /// after this mutation's own if it fails too, and are dropped if it succeeds.
+    var inheritedRollbacks: [(id: UInt64, rollback: MutationRollback)] = []
 
     init(
         id: UInt64,
@@ -241,9 +248,15 @@ extension QueryProvider {
                     try Self.saveIfNeeded(context)
                 })
             } catch {
-                let rollbacks = recorder.dataRollbacks
+                // Newest first, so each restore finds the data its own step left. The update may
+                // have cancelled fetches of these keys, so they refetch afterwards.
+                let rollbacks = recorder.dataRollbacks.reversed()
+                let changed = recorder.filters
                 Task {
                     for rollback in rollbacks { await rollback() }
+                    if !changed.isEmpty {
+                        await self.invalidateAndRefetch(changed, refetch: .active)
+                    }
                 }
                 releasePendingMutations([marker].compactMap { $0 })
                 if let scopeKey { mutations.release(scopeKey, group) }
@@ -289,7 +302,7 @@ extension QueryProvider {
         )
         if run.isOptimistic {
             optimisticFilters[id] = filters
-            optimisticHistory.append(OptimisticEntry(id: id, scope: scopeKey, filters: filters))
+            optimisticHistory.append(OptimisticEntry(id: id, scope: scopeKey, filters: filters, run: run))
             undecidedOptimistic.insert(id)
             holdCoveredClients()
         }
@@ -319,25 +332,37 @@ extension QueryProvider {
             run.group.pending -= 1
             optimisticFilters[run.id] = nil
             var skippedRollback = false
+            var rollbacks = run.inheritedRollbacks
             if let rollback = run.rollback {
-                if !isSuperseded(run) {
+                rollbacks.append((run.id, rollback))
+            }
+            if !rollbacks.isEmpty {
+                switch rollbackDecision(for: run) {
+                case .apply:
                     let context = modelContainer.mainContext
                     do {
-                        try rollback(context)
+                        // Newest first: each restores the values the one after it found.
+                        for entry in rollbacks.sorted(by: { $0.id > $1.id }) {
+                            try entry.rollback(context)
+                        }
                         try Self.saveIfNeeded(context)
                     } catch {
                         skippedRollback = true
                     }
-                } else {
-                    // A newer optimistic edit may cover the same rows; the refetch below fixes
-                    // whatever this one left behind.
+                case .handOff(let heir):
+                    // A newer edit covers the same data and its call hasn't returned: roll back
+                    // with it if it fails too, or drop this rollback if it succeeds.
+                    heir.inheritedRollbacks += rollbacks
+                    skippedRollback = true
+                case .drop:
+                    // A newer edit to the same data succeeded; rolling back would clobber it.
                     skippedRollback = true
                 }
             }
-            decide(run)
+            decide(run, succeeded: false)
             // Query data only restores while it still holds this update, so it never clobbers
-            // a newer one.
-            for rollback in run.dataRollbacks {
+            // a newer one. Newest first, so each restore finds the data its own step left.
+            for rollback in run.dataRollbacks.reversed() {
                 await rollback()
             }
             await settle(run, skippedRollback: skippedRollback)
@@ -346,21 +371,38 @@ extension QueryProvider {
         run.gate?.open()
         run.group.pending -= 1
         optimisticFilters[run.id] = nil
-        decide(run)
+        decide(run, succeeded: true)
         await settle(run, skippedRollback: false)
         return result
     }
 
-    /// Whether a newer optimistic mutation may have edited what `run` edited: one in the same
-    /// scope, or whose filters overlap `run`'s. Rolling back would then clobber that edit.
-    private func isSuperseded(_ run: MutationRun) -> Bool {
-        optimisticHistory.contains { $0.id > run.id && $0.overlaps(scope: run.scope, filters: run.filters) }
+    private enum RollbackDecision {
+        case apply
+        case handOff(MutationRun)
+        case drop
+    }
+
+    /// What to do with a failed mutation's rollbacks, given the newer optimistic mutations that
+    /// may have edited the same data: one in the same scope, or whose filters overlap.
+    /// - One of them succeeded: drop them, since rolling back would clobber its edit.
+    /// - One hasn't returned: hand them to the newest such mutation, to run if it fails too.
+    /// - Otherwise (none, or all failed and rolled back to this one's edit): apply them.
+    private func rollbackDecision(for run: MutationRun) -> RollbackDecision {
+        let newer = optimisticHistory.filter {
+            $0.id > run.id && $0.overlaps(scope: run.scope, filters: run.filters)
+        }
+        if newer.contains(where: { $0.succeeded == true }) { return .drop }
+        if let heir = newer.last(where: { $0.succeeded == nil })?.run { return .handOff(heir) }
+        return .apply
     }
 
     /// Records that an optimistic mutation succeeded or failed, and forgets the entries no
     /// undecided mutation is older than.
-    private func decide(_ run: MutationRun) {
+    private func decide(_ run: MutationRun, succeeded: Bool) {
         guard run.isOptimistic else { return }
+        if let index = optimisticHistory.firstIndex(where: { $0.id == run.id }) {
+            optimisticHistory[index].succeeded = succeeded
+        }
         undecidedOptimistic.remove(run.id)
         let oldest = undecidedOptimistic.min() ?? .max
         optimisticHistory.removeAll { $0.id < oldest }
@@ -371,8 +413,11 @@ extension QueryProvider {
     /// shows them, so the edit it left behind is replaced by the server's data.
     private func settle(_ run: MutationRun, skippedRollback: Bool) async {
         guard let scope = run.scope else {
-            await invalidateAndRefetch(run.filters, refetch: skippedRollback ? .all : .active)
-            releasePendingMutations([run.marker].compactMap { $0 })
+            // A marker whose keys couldn't all be marked invalidated stays, so the next launch
+            // invalidates them instead.
+            if await invalidateAndRefetch(run.filters, refetch: skippedRollback ? .all : .active) {
+                releasePendingMutations([run.marker].compactMap { $0 })
+            }
             return
         }
         run.group.filters.formUnion(run.filters)
@@ -386,8 +431,9 @@ extension QueryProvider {
         run.group.skippedRollback = false
         run.group.markers = []
         mutations.release(scope, run.group)
-        await invalidateAndRefetch(filters, refetch: everywhere ? .all : .active)
-        releasePendingMutations(markers)
+        if await invalidateAndRefetch(filters, refetch: everywhere ? .all : .active) {
+            releasePendingMutations(markers)
+        }
     }
 
     /// Records an optimistic mutation's filters as pending, and returns the marker's key. One small

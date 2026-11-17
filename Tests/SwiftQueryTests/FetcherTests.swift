@@ -349,6 +349,43 @@ struct FetcherTests {
         #expect(try fresh.fetch(QueryRecord.descriptor(key: TestNote.queryKey)).first?.stateData == nil)
     }
 
+    @Test("A client created while remove runs is removed with the rest")
+    func removeCoversNewClients() async throws {
+        let (provider, _, server) = try makeProvider()
+        let fetching = provider.client(for: TestDetail(id: "1"))
+        await fetching.refresh()
+        let stored = QueryRecord.Key.make(TestDetail(id: "2"))
+        let context = ModelContext(provider.modelContainer)
+        context.insert(TestProfile(userID: "2", bio: "Grace"))
+        context.insert(QueryRecord(
+            key: stored, stateData: try JSONEncoder().encode(TestDetail.QueryData(version: 1)),
+            lastSyncedAt: .now, tags: QueryRecord.Tags.encode(["users"])
+        ))
+        try context.save()
+        await server.checkpoints.hold("fetch")
+        let refresh = Task { await fetching.refresh() }
+        await server.checkpoints.reached("fetch", count: 2)
+
+        let removal = Task { await provider.remove(.type(TestDetail.self)) }
+        await server.checkpoints.reached("fetch-cancelled")
+        // Created while remove waits for the first key's fetch to stop.
+        let late = provider.client(for: TestDetail(id: "2"))
+        #expect(late.state.isPending)
+        await server.checkpoints.release("fetch")
+        await refresh.value
+        await removal.value
+
+        #expect(try record(provider, stored) == nil)
+        #expect(try profiles(provider)["2"] == nil)
+    }
+
+    @Test("Empty tags survive encoding")
+    func emptyTag() {
+        #expect(QueryRecord.Tags.decode(QueryRecord.Tags.encode([""])) == [""])
+        #expect(QueryRecord.Tags.decode(QueryRecord.Tags.encode(["", "a"])) == ["", "a"])
+        #expect(QueryRecord.Tags.decode("").isEmpty)
+    }
+
     // MARK: Provider methods
 
     @Test("state(for:) reads stored state without creating a client")

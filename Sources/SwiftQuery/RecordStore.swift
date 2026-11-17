@@ -43,17 +43,32 @@ actor RecordStore {
 
     // MARK: Writing
 
-    /// Marks keys matching any of `filters`, except `excluded` ones, as invalidated.
-    func markInvalidated(_ filters: [QueryFilter], except excluded: Set<String>) {
+    /// Marks keys matching any of `filters`, except `excluded` ones, as invalidated, saving once.
+    /// If that save fails, each key is marked and saved on its own. Returns whether every key
+    /// was marked.
+    @discardableResult
+    func markInvalidated(_ filters: [QueryFilter], except excluded: Set<String>) -> Bool {
         let context = newContext()
-        for record in records(matching: filters, except: excluded, in: context, properties: [\.key, \.invalidated])
-        where !record.invalidated {
+        let records = records(matching: filters, except: excluded, in: context, properties: [\.key, \.invalidated])
+            .filter { !$0.invalidated }
+        guard !records.isEmpty else { return true }
+        let keys = Set(records.map(\.key))
+        for record in records {
             record.invalidated = true
         }
-        guard context.hasChanges else { return }
-        if (try? context.save()) == nil {
-            context.rollback()
+        if (try? context.save()) != nil { return true }
+        context.rollback()
+        var marked = true
+        for key in keys {
+            let single = newContext()
+            for record in (try? single.fetch(QueryRecord.descriptor(key: key))) ?? [] {
+                record.invalidated = true
+            }
+            if (try? single.save()) == nil {
+                marked = false
+            }
         }
+        return marked
     }
 
     /// Evicts keys matching any of `filters`, except `excluded` ones.

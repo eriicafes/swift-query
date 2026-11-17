@@ -95,35 +95,27 @@ extension TestUser: QueryModel {
 
     static var cache: QueryCache { .forever() }
 
-    static func fetch(
-        context: ModelContext,
-        fetchContext: Context,
-        previous: QueryData?
-    ) async throws -> QueryData {
-        let response = try await fetchContext.server.list(etag: previous?.etag)
+    static func fetch(query: QueryFetch<Context, QueryData>) async throws -> QueryData {
+        let context = query.modelContext
+        let response = try await query.context.server.list(etag: query.previous?.etag)
         try context.delete(model: TestUser.self)
         for (id, name) in response.users {
             context.insert(TestUser(id: id, name: name))
         }
-        if fetchContext.saves {
+        if query.context.saves {
             try context.save()
         }
         return QueryData(etag: response.etag)
     }
 
-    static func subscribe(
-        container: ModelContainer,
-        fetchContext: Context,
-        previous: QueryData?,
-        writer: QueryDataWriter<QueryData>
-    ) -> Task<Void, Never>? {
-        guard fetchContext.subscribes else { return nil }
-        let server = fetchContext.server
-        return Task { await server.subscription() }
+    static func subscribe(query: QuerySubscription<Context, QueryData>) async throws {
+        guard query.context.subscribes else { return }
+        _ = await query.begin()
+        await query.context.server.subscription()
     }
 
-    static func evict(context: ModelContext) throws {
-        try context.delete(model: TestUser.self)
+    static func evict(query: QueryEvict<Context>) throws {
+        try query.modelContext.delete(model: TestUser.self)
     }
 }
 
@@ -135,7 +127,7 @@ final class TestPost {
 
 extension TestPost: QueryModel {
     static var cache: QueryCache { .swr() }
-    static func fetch(context: ModelContext, fetchContext: Void, previous: Int?) async throws -> Int { 0 }
+    static func fetch(query: QueryFetch<Void, Int>) async throws -> Int { 0 }
 }
 
 @MainActor
@@ -257,18 +249,14 @@ extension TestNote: QueryModel {
     }
     static var cache: QueryCache { .forever() }
 
-    static func fetch(
-        context: ModelContext,
-        fetchContext: Context,
-        previous: QueryData?
-    ) async throws -> QueryData {
-        let response = try await fetchContext.server.list(etag: previous?.etag)
-        try context.delete(model: TestNote.self)
-        context.insert(TestNote(text: "note"))
+    static func fetch(query: QueryFetch<Context, QueryData>) async throws -> QueryData {
+        let response = try await query.context.server.list(etag: query.previous?.etag)
+        try query.modelContext.delete(model: TestNote.self)
+        query.modelContext.insert(TestNote(text: "note"))
         return QueryData(etag: response.etag)
     }
 
-    static func evict(context: ModelContext) throws {
+    static func evict(query: QueryEvict<Context>) throws {
         throw EvictionError()
     }
 }
@@ -295,28 +283,24 @@ struct TestDetail: QueryFetcher {
     var cache: QueryCache? { .swr(staleTime: .seconds(3600)) }
     var tags: Set<String> { ["users", "user-\(id)"] }
 
-    func fetch(context: ModelContext, fetchContext: TestUser.Context, previous: QueryData?) async throws -> QueryData {
+
+    func fetch(query: QueryFetch<TestUser.Context, QueryData>) async throws -> QueryData {
         let id = id
-        let response = try await fetchContext.server.list(etag: nil)
-        try context.delete(model: TestProfile.self, where: #Predicate { $0.userID == id })
-        context.insert(TestProfile(userID: id, bio: response.users[id] ?? "unknown"))
+        let response = try await query.context.server.list(etag: nil)
+        try query.modelContext.delete(model: TestProfile.self, where: #Predicate { $0.userID == id })
+        query.modelContext.insert(TestProfile(userID: id, bio: response.users[id] ?? "unknown"))
         return QueryData(version: response.etag)
     }
 
-    func subscribe(
-        container: ModelContainer,
-        fetchContext: TestUser.Context,
-        previous: QueryData?,
-        writer: QueryDataWriter<QueryData>
-    ) -> Task<Void, Never>? {
-        guard fetchContext.subscribes else { return nil }
-        let server = fetchContext.server
-        return Task { await server.subscription() }
+    func subscribe(query: QuerySubscription<TestUser.Context, QueryData>) async throws {
+        guard query.context.subscribes else { return }
+        _ = await query.begin()
+        await query.context.server.subscription()
     }
 
-    func evict(context: ModelContext) throws {
+    func evict(query: QueryEvict<TestUser.Context>) throws {
         let id = id
-        try context.delete(model: TestProfile.self, where: #Predicate { $0.userID == id })
+        try query.modelContext.delete(model: TestProfile.self, where: #Predicate { $0.userID == id })
     }
 }
 
@@ -349,8 +333,9 @@ struct TestRate: QueryFetcher {
     let to: String
     var cache: QueryCache? { nil }
 
-    func fetch(context: ModelContext, fetchContext: any RateSource, previous: Double?) async throws -> Double {
-        try await fetchContext.rate(from: from, to: to)
+
+    func fetch(query: QueryFetch<any RateSource, Double>) async throws -> Double {
+        try await query.context.rate(from: from, to: to)
     }
 }
 
@@ -360,8 +345,9 @@ struct TestStoredRate: QueryFetcher {
     var cache: QueryCache? { .forever() }
     var tags: Set<String> { ["rates"] }
 
-    func fetch(context: ModelContext, fetchContext: any RateSource, previous: Double?) async throws -> Double {
-        try await fetchContext.rate(from: from, to: "EUR")
+
+    func fetch(query: QueryFetch<any RateSource, Double>) async throws -> Double {
+        try await query.context.rate(from: from, to: "EUR")
     }
 }
 
@@ -372,8 +358,9 @@ struct DefaultCounter: DefaultFetchContext {
 
 struct TestDefaulted: QueryFetcher {
     var cache: QueryCache? { nil }
-    func fetch(context: ModelContext, fetchContext: DefaultCounter, previous: Int?) async throws -> Int {
-        fetchContext.value
+
+    func fetch(query: QueryFetch<DefaultCounter, Int>) async throws -> Int {
+        query.context.value
     }
 }
 
@@ -412,7 +399,8 @@ struct CountedValue: Codable, Equatable {
 struct TestCounted: QueryFetcher {
     var cache: QueryCache? { .forever() }
 
-    func fetch(context: ModelContext, fetchContext: Void, previous: CountedValue?) async throws -> CountedValue {
+
+    func fetch(query: QueryFetch<Void, CountedValue>) async throws -> CountedValue {
         CountedValue(value: 1)
     }
 }
@@ -449,13 +437,14 @@ final class EvictLatch: @unchecked Sendable {
 struct TestSlowEvict: QueryFetcher {
     var cache: QueryCache? { .forever() }
 
-    func fetch(context: ModelContext, fetchContext: Void, previous: Int?) async throws -> Int {
-        context.insert(TestProfile(userID: "slow", bio: "fetched"))
-        return (previous ?? 0) + 1
+
+    func fetch(query: QueryFetch<Void, Int>) async throws -> Int {
+        query.modelContext.insert(TestProfile(userID: "slow", bio: "fetched"))
+        return (query.previous ?? 0) + 1
     }
 
-    func evict(context: ModelContext) throws {
+    func evict(query: QueryEvict<Void>) throws {
         EvictLatch.shared.pass()
-        try context.delete(model: TestProfile.self, where: #Predicate { $0.userID == "slow" })
+        try query.modelContext.delete(model: TestProfile.self, where: #Predicate { $0.userID == "slow" })
     }
 }

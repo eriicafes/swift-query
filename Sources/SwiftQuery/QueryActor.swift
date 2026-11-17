@@ -15,6 +15,13 @@ struct QuerySnapshot: Sendable {
     var error: (any Error)?
 }
 
+/// Delays between restarting a stream that ended, and between retries of a stream's failed
+/// `begin()` fetch. Each doubles up to `maximum`, and resets once a stream has run that long.
+enum StreamBackoff {
+    static let initial: Duration = .seconds(1)
+    static let maximum: Duration = .seconds(30)
+}
+
 /// Serializes synchronization for one fetcher key.
 ///
 /// Runs on the global concurrent executor. Its own `ModelContext` is created lazily and used only
@@ -61,25 +68,48 @@ actor QueryActor<Fetcher: QueryFetcher> {
     private var deferredFetch = false
     /// How many fetch requests joined an in-flight fetch instead of starting one.
     private(set) var fetchJoins = 0
+    /// How many fetches started. For tests.
+    private(set) var fetchStarts = 0
+    /// How many writes and `synced()` calls are waiting for sync. For tests.
+    var waitingWrites: Int { syncWaiters.count }
     private var invalidations: UInt64 = 0
     private var subscriptionTask: Task<Void, Never>?
     private var subscriptionID: UInt64 = 0
-    /// How many times `subscribe` returned a task.
+    /// How many streams called `begin()`.
     private(set) var subscriptions = 0
+    /// Whether the current stream has called `begin()`.
+    private var began = false
+    /// The first fetch id that syncs the current stream: a fetch that started after `begin()`.
+    /// `nil` once one has succeeded.
+    private var syncAfter: UInt64?
+    /// Whether `begin()` arrived during a fetch that started before it, so another follows it.
+    private var followUpFetch = false
+    /// Whether a sync wanted to fetch before the stream called `begin()`, which fetches instead.
+    private var fetchOnBegin = false
+    /// Whether the last `subscribe` returned without calling `begin()`: the key has no live
+    /// updates, so syncs fetch right away instead of waiting for `begin()`.
+    private var subscribeDeclined = false
+    private var streamStartedAt: ContinuousClock.Instant?
+    private var restartDelay: Duration
+    private var beginRetryDelay: Duration
+    /// The first delay of each backoff. See ``StreamBackoff``.
+    private let initialBackoff: Duration
+    /// Writes and `synced()` calls waiting for the stream to be synced.
+    private var syncWaiters: [UInt64: CheckedContinuation<Void, any Error>] = [:]
+    private var nextWaiterID: UInt64 = 0
+    /// Callers waiting for a deferred fetch to start or be dropped.
+    private var beginWaiters: [CheckedContinuation<Void, Never>] = []
+    /// The data from the last successful fetch. A retry of the `begin()` fetch reads `previous`
+    /// from it, so data a stream wrote before it synced can't make the fetch skip anything.
+    private var lastFetchedData: Data?
     private var observers = 0
     /// The cache policy of the most recent sync, used by garbage collection so per-view
     /// overrides such as `.swr(gcTime:)` are honored.
     private var lastCache: QueryCache?
-    /// Writes from the subscription task received while a fetch is in flight, applied after it finishes.
-    private var pendingWrites: [Write] = []
-    /// Most writes kept behind one fetch. Beyond this they are saved to the stored state right
-    /// away, so a fetch that never finishes can't grow the queue without bound.
-    static var pendingWriteLimit: Int { 1_000 }
     /// How stale `lastAccessedAt` may get before a sync or detach writes it again. Keeps views
     /// that appear often (list rows) from saving on every appearance. Expiry can therefore come
     /// up to this much early, which is negligible next to cache times measured in minutes.
     static var accessResolution: TimeInterval { 60 }
-    private var stateWriter: QueryDataWriter<Fetcher.QueryData>?
     /// The last stored data known to decode. See `isDecodable`.
     private var validatedData: Data?
 
@@ -89,8 +119,12 @@ actor QueryActor<Fetcher: QueryFetcher> {
         modelContainer: ModelContainer,
         fetchContext: Fetcher.Context,
         publisher: @escaping Publisher,
-        onEvict: @escaping EvictHandler
+        onEvict: @escaping EvictHandler,
+        initialBackoff: Duration = StreamBackoff.initial
     ) {
+        self.initialBackoff = initialBackoff
+        self.restartDelay = initialBackoff
+        self.beginRetryDelay = initialBackoff
         self.fetcher = fetcher
         self.key = key
         self.persisted = fetcher.cache != nil
@@ -114,16 +148,6 @@ actor QueryActor<Fetcher: QueryFetcher> {
         context.autosaveEnabled = false
         self.context = context
         return context
-    }
-
-    /// The writer handed to `subscribe`. It holds this actor weakly.
-    private var writer: QueryDataWriter<Fetcher.QueryData> {
-        if let stateWriter { return stateWriter }
-        let writer = QueryDataWriter<Fetcher.QueryData> { [weak self] body in
-            await self?.write(body)
-        }
-        stateWriter = writer
-        return writer
     }
 
     // MARK: Operations
@@ -169,6 +193,13 @@ actor QueryActor<Fetcher: QueryFetcher> {
         await startFetch().task.value
     }
 
+    /// ``refetch()`` if the key has data; a key that was removed or never fetched isn't fetched.
+    func refetchIfFetched() async {
+        loadIfNeeded()
+        guard case .success = status else { return }
+        await refetch()
+    }
+
     /// Fetches with a request that starts after this call.
     ///
     /// An in-flight fetch may have been sent before a mutation reached the server, so it is
@@ -193,7 +224,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
         if let data = record.stateData, let lastSyncedAt = record.lastSyncedAt,
            isDecodable(data), !record.invalidated {
             let fresh = switch staleTime {
-            case nil: !(lastCache ?? defaultCache).isStale(lastSyncedAt: lastSyncedAt, now: .now)
+            case nil: isLive || !(lastCache ?? defaultCache).isStale(lastSyncedAt: lastSyncedAt, now: .now)
             case .infinite: true
             case .after(let duration): Date.now.timeIntervalSince(lastSyncedAt) < duration / .seconds(1)
             }
@@ -229,6 +260,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
             try save()
             status = .success(data, stale: false)
             lastError = nil
+            lastFetchedData = data
         } catch {
             rollback()
         }
@@ -322,20 +354,25 @@ actor QueryActor<Fetcher: QueryFetcher> {
         inFlight?.task.cancel()
     }
 
-    /// Cancels any fetch and subscription task, then evicts the key's data and clears its state.
+    /// Cancels any fetch and stream, waits for both to stop, then evicts the key's data and clears its state.
     /// Returns whether the key was evicted. The caller invalidates keys sharing its tags.
     ///
     /// Waits for a cancelled fetch to finish before evicting, so rows it saves (including rows
     /// the fetcher saved itself) are evicted too instead of reappearing afterwards.
     func remove() async -> Bool {
         loadIfNeeded()
+        // Stop the stream first so it can't start fetches or write while the key is evicted. A
+        // fetch a sync was leaving to begin() is dropped, not started, since the key is going.
+        clearFetchOnBegin()
+        let stream = subscriptionTask
+        cancelSubscription()
+        await stream?.value
         // A sync while waiting may start another fetch; it is cancelled in turn.
         while let inFlight {
             inFlight.task.cancel()
             await inFlight.task.value
         }
         // No suspension between the loop and eviction, so no fetch can start in between.
-        pendingWrites.removeAll()
         let evicted: Bool
         do {
             try evict(try record())
@@ -355,6 +392,10 @@ actor QueryActor<Fetcher: QueryFetcher> {
         guard observers > 0 else { return }
         await sync(lastCache ?? defaultCache, checkExpiry: false)
         ensureSubscribed()
+        // With a stream, the fetch waits for its begin(); wait for that first.
+        while fetchOnBegin {
+            await withCheckedContinuation { beginWaiters.append($0) }
+        }
         if let inFlight {
             await inFlight.task.value
         }
@@ -365,7 +406,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
     /// was evicted. The caller invalidates keys sharing its tags.
     func collectGarbage() async -> Bool {
         loadIfNeeded()
-        guard observers == 0, inFlight == nil else { return false }
+        guard observers == 0, inFlight == nil, subscriptionTask == nil else { return false }
         do {
             if try evictIfExpired(try record(), cache: lastCache ?? defaultCache, now: .now) {
                 await publish()
@@ -377,36 +418,42 @@ actor QueryActor<Fetcher: QueryFetcher> {
         return false
     }
 
-    /// Cancels the subscription task. The next sync from a view calls `subscribe` again.
+    /// Stops the stream for a client that's gone, without starting a fetch a sync was leaving to
+    /// its `begin()`.
+    func stop() {
+        clearFetchOnBegin()
+        cancelSubscription()
+    }
+
+    /// Cancels the stream. Waiting writes throw. The next sync from a view calls `subscribe` again.
     func cancelSubscription() {
+        let wasRunning = subscriptionTask != nil
         subscriptionTask?.cancel()
         subscriptionTask = nil
         subscriptionID &+= 1
-    }
-
-    /// Applies a write from the subscription task now, or queues it behind the in-flight fetch.
-    func write(_ body: @escaping Write) async {
-        if inFlight != nil {
-            pendingWrites.append(body)
-            if pendingWrites.count >= Self.pendingWriteLimit {
-                let overflow = pendingWrites
-                pendingWrites = []
-                await persist(overflow)
-            }
-            return
+        if wasRunning {
+            streamStopped()
         }
-        await persist([body])
+        resetStream()
+        // A sync was waiting for begin() to fetch; fetch now instead.
+        if fetchOnBegin {
+            clearFetchOnBegin()
+            startHeldFetch()
+        }
     }
 
     /// Waits until no fetch is in flight and the last one has published its final state.
     func waitForIdle() async {
+        while fetchOnBegin {
+            await withCheckedContinuation { beginWaiters.append($0) }
+        }
         while let inFlight {
             await inFlight.task.value
         }
         await lastFetch?.value
     }
 
-    /// Whether a subscription task is running.
+    /// Whether a stream is running.
     var isSubscribed: Bool { subscriptionTask != nil }
 
     // MARK: Sync
@@ -419,8 +466,8 @@ actor QueryActor<Fetcher: QueryFetcher> {
         var evicted = false
         do {
             var record = try record()
-            // Never evict while a fetch is writing the same records.
-            if checkExpiry, inFlight == nil {
+            // Never evict while a fetch or a stream is writing the same records.
+            if checkExpiry, inFlight == nil, subscriptionTask == nil {
                 evicted = try evictIfExpired(record, cache: cache, now: now)
                 if evicted { record = try self.record() }
             }
@@ -440,10 +487,12 @@ actor QueryActor<Fetcher: QueryFetcher> {
             return
         }
         if needsFetch {
-            if held, case .success = status {
-                deferredFetch = true
+            if observers > 0, !subscribeDeclined, !began {
+                // The stream's begin() fetches, so a stream that can't resume gets one fetch that
+                // covers its connection instead of two.
+                fetchOnBegin = true
             } else {
-                startFetch()
+                startHeldFetch()
             }
         }
         await publish()
@@ -460,6 +509,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
             return inFlight
         }
         nextFetchID &+= 1
+        fetchStarts += 1
         let id = nextFetchID
         // Registered before any suspension; the task body runs only after this method returns.
         let task = Task { await self.performFetch(id: id) }
@@ -470,115 +520,350 @@ actor QueryActor<Fetcher: QueryFetcher> {
 
     private func performFetch(id: UInt64) async {
         let generation = invalidations
-        let storedData = (try? record().stateData).flatMap { isDecodable($0) ? $0 : nil }
+        // Until the stream syncs, it may have written data the fetch hasn't covered.
+        let baseData = began && syncAfter != nil ? lastFetchedData : try? record().stateData
+        let storedData = baseData.flatMap { isDecodable($0) ? $0 : nil }
         fetchStatus = .fetching
         await publish()
+        var outcome = FetchOutcome.failed
 
         do {
             try Task.checkCancellation()
-            let fetchedData = try await Self.runFetch(
+            let fetched = try await Self.runFetch(
                 fetcher: fetcher,
                 stateData: storedData,
                 modelContainer: modelContainer,
                 fetchContext: fetchContext
             )
-            // A fetch cancelled while running may still return; don't save its state.
+            // A fetch cancelled while running may still return; don't save its rows or state.
+            // Checked and saved on the actor with no suspension in between, so a cancel, a
+            // removal or a stream's write can't land between the check and the save.
             try Task.checkCancellation()
-            // Updates the subscription task made during the fetch go on top of the fetched state.
-            let applied = pendingWrites
-            pendingWrites = []
-            let data = Self.applying(applied, to: fetchedData) ?? fetchedData
-            do {
-                let record = try record()
-                let now = Date.now
-                record.stateData = data
-                record.lastSyncedAt = now
-                record.lastAccessedAt = now
-                if invalidations == generation {
-                    record.invalidated = false
-                }
-                writeMetadata(record, cache: lastCache ?? defaultCache)
-                try save()
-                status = .success(data, stale: record.invalidated)
-                lastError = nil
-            } catch {
-                pendingWrites = applied + pendingWrites
-                throw error
+            if fetched.context.hasChanges {
+                try fetched.context.save()
             }
+            let data = fetched.data
+            let record = try record()
+            let now = Date.now
+            record.stateData = data
+            record.lastSyncedAt = now
+            record.lastAccessedAt = now
+            if invalidations == generation {
+                record.invalidated = false
+            }
+            writeMetadata(record, cache: lastCache ?? defaultCache)
+            try save()
+            status = .success(data, stale: record.invalidated)
+            lastError = nil
+            lastFetchedData = data
+            outcome = .succeeded
         } catch is CancellationError {
             // A cancelled fetch is not a failure; keep the previous state.
             rollback()
             lastCancelledFetch = id
+            outcome = .cancelled
         } catch {
             rollback()
             fail(error)
         }
 
-        // Only the owner of the in-flight fetch clears it. Writes still queued (after a failed
-        // fetch) apply to the stored state; later writes no longer queue.
-        var leftover: [Write] = []
+        // Only the owner of the in-flight fetch clears it.
         if inFlight?.id == id {
             inFlight = nil
             fetchStatus = .idle
-            leftover = pendingWrites
-            pendingWrites = []
+            fetchSettled(id, outcome)
         }
-        await persist(leftover)
         await publish()
     }
 
-    /// Applies writes to the stored state and saves it. Dropped when nothing has synced yet.
-    private func persist(_ writes: [Write]) async {
-        guard !writes.isEmpty else { return }
-        do {
-            let record = try record()
-            guard let data = record.stateData,
-                  record.lastSyncedAt != nil,
-                  let updated = Self.applying(writes, to: data),
-                  updated != data
-            else { return }
-            record.stateData = updated
-            try save()
-            let stale: Bool
-            if case .success(_, let current) = status {
-                stale = current
-            } else {
-                stale = record.invalidated
+    private enum FetchOutcome { case succeeded, failed, cancelled }
+
+    /// Fetches unless an optimistic mutation holds the key, in which case its release fetches.
+    private func startHeldFetch() {
+        if held, case .success = status {
+            deferredFetch = true
+        } else {
+            startFetch()
+        }
+    }
+
+    // MARK: Streams
+
+    /// Whether the stream's `begin()` fetch has succeeded.
+    private var streamSynced: Bool { began && syncAfter == nil }
+
+    /// Whether a synced stream keeps the data current, so it doesn't go stale by time, unless the
+    /// key asks to refetch anyway.
+    private var isLive: Bool { streamSynced && !fetcher.refetchWhileSubscribed }
+
+    /// Whether writes that wait for sync may run.
+    private var isSynced: Bool { streamSynced && inFlight == nil }
+
+    /// Calls `subscribe` if no stream is running.
+    private func ensureSubscribed() {
+        guard subscriptionTask == nil else { return }
+        subscriptionID &+= 1
+        let id = subscriptionID
+        resetStream()
+        let stored = (try? record().stateData).flatMap { isDecodable($0) ? $0 : nil }
+        let writer = QueryWriter<Fetcher.QueryData>(target: WriterBox(self, subscription: id))
+        let query = QuerySubscription<Fetcher.Context, Fetcher.QueryData>(
+            context: fetchContext,
+            previous: Self.decodedState(stored),
+            begin: { [weak self] in
+                await self?.begin(id)
+                return writer
             }
-            status = .success(updated, stale: stale)
-            await publish()
+        )
+        let fetcher = fetcher
+        streamStartedAt = .now
+        // Weak, so a running stream doesn't keep this actor (which cancels it on deinit) alive.
+        subscriptionTask = Task { [weak self] in
+            var failed = false
+            do {
+                try await Self.runSubscribe(fetcher: fetcher, query: query)
+            } catch {
+                failed = true
+            }
+            await self?.subscriptionEnded(id, failed: failed)
+        }
+    }
+
+    private nonisolated static func runSubscribe(fetcher: Fetcher, query: QuerySubscription<Fetcher.Context, Fetcher.QueryData>) async throws {
+        try await fetcher.subscribe(query: query)
+    }
+
+    /// Starts the fetch the stream's writes wait for: now, or after the fetch in flight, which
+    /// started before the stream was ready.
+    private func begin(_ id: UInt64) {
+        guard id == subscriptionID, subscriptionTask != nil, !began else { return }
+        began = true
+        subscriptions += 1
+        clearFetchOnBegin()
+        if let inFlight {
+            syncAfter = inFlight.id &+ 1
+            followUpFetch = true
+        } else {
+            syncAfter = nextFetchID &+ 1
+            startHeldFetch()
+        }
+    }
+
+    /// Handles a stream that returned or threw on its own.
+    private func subscriptionEnded(_ id: UInt64, failed: Bool) {
+        guard id == subscriptionID, subscriptionTask != nil else { return }
+        let didBegin = began
+        let wantedFetch = fetchOnBegin
+        subscriptionTask = nil
+        streamStopped()
+        resetStream()
+        clearFetchOnBegin()
+        if !didBegin && !failed {
+            // No live updates for this key.
+            subscribeDeclined = true
+            if wantedFetch { startHeldFetch() }
+            return
+        }
+        subscribeDeclined = false
+        // A sync waiting for this stream's begin() fetches now instead, so a stream that fails to
+        // connect doesn't leave the data unfetched, and doesn't refetch data that's still fresh.
+        if !didBegin && wantedFetch { startHeldFetch() }
+        guard observers > 0 else { return }
+        if let started = streamStartedAt, started.duration(to: .now) >= StreamBackoff.maximum {
+            restartDelay = initialBackoff
+        }
+        let delay = restartDelay
+        restartDelay = min(restartDelay * 2, StreamBackoff.maximum)
+        let generation = subscriptionID
+        Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            await self?.restartSubscription(generation)
+        }
+    }
+
+    private func restartSubscription(_ generation: UInt64) {
+        guard subscriptionID == generation, subscriptionTask == nil, observers > 0 else { return }
+        ensureSubscribed()
+    }
+
+    /// Records a use of the key, since the stream kept it in use after its last view went away,
+    /// and publishes its staleness again if a synced stream was keeping it fresh. Call before
+    /// `resetStream`.
+    private func streamStopped() {
+        do {
+            Self.touch(try record(), now: .now)
+            try save()
         } catch {
             rollback()
         }
+        guard isLive else { return }
+        began = false
+        if let record = try? record(), let (data, stale) = freshness(of: record, cache: lastCache ?? defaultCache, now: .now),
+           case .success(_, false) = status, stale {
+            status = .success(data, stale: true)
+            Task { [weak self] in await self?.publishStatus() }
+        }
     }
 
-    /// Calls `subscribe` if no subscription task is running, and keeps the task it returns.
-    private func ensureSubscribed() {
-        guard subscriptionTask == nil else { return }
-        let storedData = (try? record().stateData).flatMap { isDecodable($0) ? $0 : nil }
-        guard let task = Self.runSubscribe(
-            fetcher: fetcher,
-            stateData: storedData,
-            modelContainer: modelContainer,
-            fetchContext: fetchContext,
-            writer: writer
-        ) else { return }
-        subscriptions += 1
-        subscriptionID &+= 1
-        let id = subscriptionID
-        subscriptionTask = task
-        // Forget the task once it ends on its own, so the next sync from a view subscribes again.
-        // Weak, so a running task doesn't keep this actor (which cancels it on deinit) alive.
+    private func publishStatus() async {
+        await publish()
+    }
+
+    /// Clears the stream's sync state and fails its waiting writes. A fetch deferred to `begin()`
+    /// stays deferred; whoever ends the stream decides what happens to it.
+    private func resetStream() {
+        began = false
+        syncAfter = nil
+        followUpFetch = false
+        beginRetryDelay = initialBackoff
+        let waiters = syncWaiters.values
+        syncWaiters = [:]
+        for waiter in waiters {
+            waiter.resume(throwing: CancellationError())
+        }
+    }
+
+    private func clearFetchOnBegin() {
+        fetchOnBegin = false
+        let waiters = beginWaiters
+        beginWaiters = []
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    /// Updates the stream's sync state after a fetch settles, and resumes writes once synced.
+    private func fetchSettled(_ id: UInt64, _ outcome: FetchOutcome) {
+        if began, let after = syncAfter {
+            if outcome == .succeeded, id >= after {
+                syncAfter = nil
+                beginRetryDelay = initialBackoff
+            } else if followUpFetch {
+                followUpFetch = false
+                startHeldFetch()
+            } else if id >= after {
+                if outcome == .cancelled, optimisticallyCancelledFetch == id {
+                    // An optimistic update's cancel fetches again once its hold ends.
+                    startHeldFetch()
+                } else {
+                    // A failure, or a cancel from `cancel()`: the cancelled request stays
+                    // stopped, and the stream syncs with a retry after a backoff instead of
+                    // leaving its writes waiting until something else fetches.
+                    scheduleBeginRetry()
+                }
+            }
+        }
+        guard isSynced else { return }
+        let waiters = syncWaiters.values
+        syncWaiters = [:]
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    private func scheduleBeginRetry() {
+        let delay = beginRetryDelay
+        beginRetryDelay = min(beginRetryDelay * 2, StreamBackoff.maximum)
+        let generation = subscriptionID
         Task { [weak self] in
-            await task.value
-            await self?.subscriptionEnded(id)
+            try? await Task.sleep(for: delay)
+            await self?.retryBeginFetch(generation)
         }
     }
 
-    private func subscriptionEnded(_ id: UInt64) {
-        if subscriptionID == id {
-            subscriptionTask = nil
+    private func retryBeginFetch(_ generation: UInt64) {
+        guard generation == subscriptionID, began, syncAfter != nil, inFlight == nil else { return }
+        startHeldFetch()
+    }
+
+    private func checkStream(_ id: UInt64) throws {
+        guard id == subscriptionID, subscriptionTask != nil, began, !Task.isCancelled else {
+            throw CancellationError()
         }
+    }
+
+    private func waitUntilSynced(_ id: UInt64) async throws {
+        try checkStream(id)
+        while !isSynced {
+            nextWaiterID &+= 1
+            let waiter = nextWaiterID
+            // A caller whose task is cancelled stops waiting right away, like any other await.
+            try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                    if Task.isCancelled {
+                        continuation.resume(throwing: CancellationError())
+                    } else {
+                        syncWaiters[waiter] = continuation
+                    }
+                }
+            } onCancel: {
+                Task { await self.cancelWaiter(waiter) }
+            }
+            try checkStream(id)
+        }
+    }
+
+    private func cancelWaiter(_ id: UInt64) {
+        syncWaiters.removeValue(forKey: id)?.resume(throwing: CancellationError())
+    }
+
+    /// Runs a stream's write: the closure and the saves happen with no suspension in between, so
+    /// no fetch can start or save during them. If the closure throws, nothing is saved.
+    private func performWrite<R: Sendable>(
+        _ body: (inout QueryWriter<Fetcher.QueryData>.Transaction) throws -> R
+    ) async throws -> R {
+        loadIfNeeded()
+        // A fresh context per write, so rows are read as the store has them now, not as an
+        // earlier write left them, and a long stream doesn't keep every row it wrote in memory.
+        let context = ModelContext(modelContainer)
+        context.autosaveEnabled = false
+        let record = try record()
+        let stored = record.stateData.flatMap { isDecodable($0) ? $0 : nil }
+        let initial = Self.decodedState(stored)
+        var tx = QueryWriter<Fetcher.QueryData>.Transaction(
+            modelContext: context,
+            data: initial,
+            isSynced: isSynced
+        )
+        let result = try body(&tx)
+        // Compared with sorted keys, so data holding a dictionary doesn't look changed when it isn't.
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        var changedData: Data?
+        if let data = tx.data, let encoded = try? encoder.encode(data),
+           encoded != initial.flatMap({ try? encoder.encode($0) }) {
+            changedData = encoded
+        }
+        // Data, then rows, with no suspension in between or before: no fetch can start or save
+        // during the write. The data goes first because it can be put back if the rows fail.
+        if let changedData {
+            record.stateData = changedData
+            do {
+                try save()
+            } catch {
+                rollback()
+                record.stateData = stored
+                throw error
+            }
+        }
+        if context.hasChanges {
+            do {
+                try context.save()
+            } catch {
+                context.rollback()
+                if changedData != nil {
+                    record.stateData = stored
+                    do { try save() } catch { rollback() }
+                }
+                throw error
+            }
+        }
+        // Data written before anything synced is stored, but the key doesn't count as fetched.
+        if changedData != nil, let (data, stale) = freshness(of: record, cache: lastCache ?? defaultCache, now: .now) {
+            status = .success(data, stale: stale)
+            await publish()
+        }
+        return result
     }
 
     // MARK: Helpers
@@ -600,6 +885,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
               let (data, stale) = freshness(of: record, cache: defaultCache, now: .now)
         else { return }
         status = .success(data, stale: stale)
+        lastFetchedData = data
     }
 
     /// Returns the stored state and whether it is stale, or `nil` when there is no usable state.
@@ -610,7 +896,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
               let lastSyncedAt = record.lastSyncedAt,
               isDecodable(data)
         else { return nil }
-        let stale = record.invalidated || cache.isStale(lastSyncedAt: lastSyncedAt, now: now)
+        let stale = record.invalidated || (!isLive && cache.isStale(lastSyncedAt: lastSyncedAt, now: now))
         return (data, stale)
     }
 
@@ -631,10 +917,12 @@ actor QueryActor<Fetcher: QueryFetcher> {
         try save()
         status = .pending
         lastError = nil
+        // The next fetch starts from nothing, not from the evicted data's cursor or ETag.
+        lastFetchedData = nil
 
         let context = ModelContext(modelContainer)
         context.autosaveEnabled = false
-        try fetcher.evict(context: context)
+        try fetcher.evict(query: QueryEvict(modelContext: context, context: fetchContext))
         if context.hasChanges {
             try context.save()
         }
@@ -674,18 +962,6 @@ actor QueryActor<Fetcher: QueryFetcher> {
         record.lastAccessedAt = now
     }
 
-    /// Decodes `data`, applies `writes` in order, and re-encodes. `nil` if it doesn't decode.
-    private static func applying(_ writes: [Write], to data: Data) -> Data? {
-        guard !writes.isEmpty else { return data }
-        guard var state = try? JSONDecoder().decode(Fetcher.QueryData.self, from: data) else {
-            return nil
-        }
-        for write in writes {
-            write(&state)
-        }
-        return try? JSONEncoder().encode(state)
-    }
-
     /// Whether `data` decodes as `QueryData`. The last data known to decode is remembered, so
     /// checking unchanged state compares bytes instead of decoding it again.
     private func isDecodable(_ data: Data) -> Bool {
@@ -699,43 +975,31 @@ actor QueryActor<Fetcher: QueryFetcher> {
         data.flatMap { try? JSONDecoder().decode(Fetcher.QueryData.self, from: $0) }
     }
 
-    /// Runs the fetch outside actor isolation with a fresh context.
-    /// Only `Sendable` values cross into and out of it.
+    /// Runs the fetch outside actor isolation with a fresh context, and hands the context back
+    /// unsaved so the actor saves it. Only `Sendable` values and that context cross.
     private static func runFetch(
         fetcher: Fetcher,
         stateData: Data?,
         modelContainer: ModelContainer,
         fetchContext: Fetcher.Context
-    ) async throws -> Data {
+    ) async throws -> sending FetchedState {
         let context = ModelContext(modelContainer)
         context.autosaveEnabled = false
         let state = try await fetcher.fetch(
-            context: context,
-            fetchContext: fetchContext,
-            previous: decodedState(stateData)
+            query: QueryFetch(modelContext: context, context: fetchContext, previous: decodedState(stateData))
         )
-        // A fetch cancelled while running (by removal or an optimistic update) must not save
-        // its rows over the eviction or the edit.
-        try Task.checkCancellation()
-        if context.hasChanges {
-            try context.save()
-        }
-        return try JSONEncoder().encode(state)
+        return FetchedState(data: try JSONEncoder().encode(state), context: context)
     }
 
-    private static func runSubscribe(
-        fetcher: Fetcher,
-        stateData: Data?,
-        modelContainer: ModelContainer,
-        fetchContext: Fetcher.Context,
-        writer: QueryDataWriter<Fetcher.QueryData>
-    ) -> Task<Void, Never>? {
-        fetcher.subscribe(
-            container: modelContainer,
-            fetchContext: fetchContext,
-            previous: decodedState(stateData),
-            writer: writer
-        )
+    /// A fetch's encoded state and its unsaved rows.
+    private final class FetchedState {
+        let data: Data
+        let context: ModelContext
+
+        init(data: Data, context: ModelContext) {
+            self.data = data
+            self.context = context
+        }
     }
 
     private func save() throws {
@@ -785,5 +1049,25 @@ actor QueryActor<Fetcher: QueryFetcher> {
                 error: lastError
             )
         )
+    }
+}
+
+extension QueryActor: QueryWriterTarget {
+    typealias QueryData = Fetcher.QueryData
+
+    func write<R: Sendable>(
+        subscription id: UInt64,
+        timing: QueryWriter<QueryData>.Timing,
+        _ body: @escaping @Sendable (inout QueryWriter<QueryData>.Transaction) throws -> R
+    ) async throws -> R {
+        try checkStream(id)
+        if timing == .synced {
+            try await waitUntilSynced(id)
+        }
+        return try await performWrite(body)
+    }
+
+    func waitUntilSynced(subscription id: UInt64) async throws {
+        try await waitUntilSynced(id)
     }
 }

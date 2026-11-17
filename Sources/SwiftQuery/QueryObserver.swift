@@ -58,6 +58,7 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
         initialLoad: InitialLoad = .stored,
         onEvict: @escaping QueryActor<Fetcher>.EvictHandler = { _, _ in }
     ) {
+        let streamBackoff = provider.streamBackoff
         let sink = SnapshotSink<Fetcher>()
         self.fetcher = fetcher
         self.recordKey = recordKey
@@ -69,12 +70,20 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
             modelContainer: modelContainer,
             fetchContext: fetchContext,
             publisher: { snapshot in await sink.receive(snapshot) },
-            onEvict: onEvict
+            onEvict: onEvict,
+            initialBackoff: streamBackoff
         )
         sink.client = self
         // Operations wait for store work on this key that was still running at creation.
         tail = gate
         loadInitialState(initialLoad)
+    }
+
+    deinit {
+        // A stream's waiting write keeps the actor alive, so stop the stream here rather than
+        // relying on the actor's deinit, or a released key would keep its stream and retries.
+        let actor = actor
+        Task { await actor.stop() }
     }
 
     /// How a new client fills ``state`` before its first sync.
@@ -268,6 +277,13 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
         await actor.setQueryData(data)
     }
 
+    /// Fetches with a request sent after this call if the key has data, once the operations
+    /// already queued have run. A key removed or never fetched isn't fetched.
+    func refetchIfFetched() async {
+        await tail?.value
+        await actor.refetchIfFetched()
+    }
+
     /// Cancels the in-flight fetch once the operations already queued have run.
     func cancelFetch() async {
         await tail?.value
@@ -276,8 +292,16 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
 
     /// Removes the key's data. Returns whether it was evicted.
     func remove() async -> Bool {
-        await tail?.value
-        return await actor.remove()
+        // Takes a place in the queue, so syncs queued meanwhile run after the removal instead of
+        // starting a stream or fetch while it waits for the old ones to stop.
+        let previous = tail
+        let actor = actor
+        let removal = Task {
+            await previous?.value
+            return await actor.remove()
+        }
+        tail = Task { _ = await removal.value }
+        return await removal.value
     }
 
     /// Syncs again if a view still shows the key, waiting for any fetch it starts to finish.
@@ -315,6 +339,16 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
     /// How many fetch requests have joined an in-flight fetch.
     func fetchJoins() async -> Int {
         await actor.fetchJoins
+    }
+
+    /// How many fetches started.
+    func fetchStarts() async -> Int {
+        await actor.fetchStarts
+    }
+
+    /// How many writes are waiting for the stream to sync.
+    func waitingWrites() async -> Int {
+        await actor.waitingWrites
     }
 
     func settle() async {
