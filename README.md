@@ -214,7 +214,7 @@ A query's `cache` decides when its data is fresh and how long it's kept:
 .swr(staleTime: .seconds(30), gcTime: .seconds(60 * 60))
 ```
 
-- **Fresh** data is shown without fetching. **Stale** data is still shown, and a fetch runs in the background to replace it. This is called stale-while-revalidate.
+- **Fresh** data is shown without fetching. **Stale** data is still shown, and a fetch runs in the background to replace it.
 - `staleTime` is how long data stays fresh after a fetch.
 - `gcTime` is how long unused data is kept with `.swr`. Data is in use while a view shows it, and the clock starts when the last such view goes away. When it runs out, the data is removed (see [Cleaning up](#cleaning-up)).
 - Fetched data and its freshness are saved, so they survive app launches.
@@ -327,7 +327,7 @@ The value is saved in SwiftQuery's own `QueryRecord` model, so it's available on
 
 ### Query data across fetches
 
-`query.previous` lets a fetch build on the last one. A common use is an ETag, so the server can answer "not modified":
+`query.previous` lets a fetch build on the last one, for example to send an ETag:
 
 ```swift
 extension Post: QueryModel {
@@ -438,7 +438,7 @@ await provider.invalidate(.all)                             // everything
 await provider.invalidate(.tag("users"), .type(Post.self))  // several at once
 ```
 
-Pass `refetch:` to choose what fetches right away: `.active` (the default) for data shown in a view, `.inactive` for everything else including data saved earlier, `.all` for both, or `nil` to only mark it stale. From synchronous code such as a button action, wrap the call in a `Task`.
+Pass `refetch:` to choose what fetches right away: `.active` (the default) for data shown in a view, `.inactive` for everything else including data saved earlier, `.all` for both, or `nil` to only mark it stale.
 
 Tags group data that changes together. Give models and fetchers tags with `tags`:
 
@@ -479,7 +479,7 @@ A cancelled fetch never saves the rows it left in `query.modelContext`. Rows a f
 
 ## Mutations
 
-A mutation changes data on the server. Run it from the client whose data it changes, and that data is fetched again afterwards so it matches the server:
+Run a mutation from the client whose data it changes, and that data is fetched again afterwards so it matches the server:
 
 ```swift
 try await postsClient.mutate {
@@ -668,13 +668,13 @@ If an optimistic mutation's request fails after a stream wrote the same row, its
 
 ## Concurrency
 
-`fetch` and `subscribe` run in the background, off the main actor. Waiting for the network doesn't block the UI either way, but the work around it would: decoding a large response, creating and updating many models, and saving them to the store. Running in the background keeps that work from causing dropped frames.
+`fetch` and `subscribe` run off the main actor, so decoding, creating models and saving don't block the UI.
 
-Each fetch gets its own `ModelContext`, and so does each of a stream's writes. SwiftData requires a context to be used from one place at a time, and these never leave their `fetch` or write. Saving them updates the main context, so `@Query` sees the changes.
+Each fetch gets its own `ModelContext`, and so does each of a stream's writes; they never leave their `fetch` or write. Saving them updates the main context, so `@Query` sees the changes.
 
 ### Main-actor default isolation
 
-In a Swift 6.2 app target that uses main-actor default isolation, as new Xcode projects do, everything you declare runs on the main actor unless you say otherwise. Two things need `nonisolated`.
+In a Swift 6.2 app target that uses main-actor default isolation, as new Xcode projects do, two things need `nonisolated`.
 
 The conformance, or the code won't compile:
 
@@ -690,7 +690,7 @@ nonisolated struct API: Sendable {
 }
 ```
 
-Without the second one, everything still compiles and works, but each call from `fetch` hops to the main actor to run, so work such as decoding happens on the main thread. You won't notice it with small responses, but large ones will stall scrolling and taps.
+Without the second one, everything still compiles and works, but each call from `fetch` hops to the main actor, so work such as decoding happens on the main thread.
 
 ## Example
 
