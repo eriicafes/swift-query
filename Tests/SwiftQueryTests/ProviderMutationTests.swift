@@ -25,17 +25,18 @@ struct ProviderMutationTests {
         let (provider, users, _) = try makeProvider()
         let detail = QueryRecord.Key.make(TestDetail(id: "1"))
         let tags: Set<String> = ["users", "user-1"]
+        let detailType = String(reflecting: TestDetail.self)
 
-        #expect(QueryFilter.key(TestDetail(id: "1")).matches(key: detail, tags: tags))
-        #expect(!QueryFilter.key(TestDetail(id: "2")).matches(key: detail, tags: tags))
-        #expect(QueryFilter.key(provider.client(for: TestDetail(id: "1"))).matches(key: detail, tags: tags))
-        #expect(QueryFilter.type(TestDetail.self).matches(key: detail, tags: tags))
-        #expect(!QueryFilter.type(TestUser.self).matches(key: detail, tags: tags))
-        #expect(QueryFilter.type(TestUser.self).matches(key: users.recordKey, tags: []))
-        #expect(QueryFilter.key(users).matches(key: users.recordKey, tags: []))
-        #expect(QueryFilter.tag("user-1").matches(key: detail, tags: tags))
-        #expect(!QueryFilter.tag("user").matches(key: detail, tags: tags))
-        #expect(QueryFilter.all.matches(key: detail, tags: tags))
+        #expect(QueryFilter.key(TestDetail(id: "1")).matches(key: detail, type: detailType, tags: tags))
+        #expect(!QueryFilter.key(TestDetail(id: "2")).matches(key: detail, type: detailType, tags: tags))
+        #expect(QueryFilter.key(provider.client(for: TestDetail(id: "1"))).matches(key: detail, type: detailType, tags: tags))
+        #expect(QueryFilter.type(TestDetail.self).matches(key: detail, type: detailType, tags: tags))
+        #expect(!QueryFilter.type(TestUser.self).matches(key: detail, type: detailType, tags: tags))
+        #expect(QueryFilter.type(TestUser.self).matches(key: users.recordKey, type: users.typeName, tags: []))
+        #expect(QueryFilter.key(users).matches(key: users.recordKey, type: users.typeName, tags: []))
+        #expect(QueryFilter.tag("user-1").matches(key: detail, type: detailType, tags: tags))
+        #expect(!QueryFilter.tag("user").matches(key: detail, type: detailType, tags: tags))
+        #expect(QueryFilter.all.matches(key: detail, type: detailType, tags: tags))
     }
 
     @Test("Filters overlap when they may match a common key")
@@ -957,5 +958,103 @@ struct ProviderMutationTests {
         await server.checkpoints.release("rename:Held")
         _ = try await mutation.value
         _ = provider
+    }
+
+    // MARK: Explicit fetches during a hold
+
+    @Test("query returns the optimistic data while a mutation covering the key is in flight, then fetches once it settles")
+    func queryHeld() async throws {
+        let (provider, users, server) = try await loaded(observed: false)
+        let fetches = await server.fetchCount
+        await server.checkpoints.hold("rename:Held")
+
+        let mutation = Task {
+            try await provider.mutate(invalidates: [.type(TestUser.self)], {
+                try await server.rename(id: "1", to: "Held")
+            }, optimistic: { tx in
+                tx.setQueryData(for: TestUser.self) { $0.etag = 99 }
+            })
+        }
+        await server.checkpoints.reached("rename:Held")
+        #expect(try await provider.query(TestUser.self, staleTime: .after(.zero)) == .init(etag: 99))
+        await users.settle()
+        #expect(await server.fetchCount == fetches)
+
+        // No view shows the key, so only the deferred query fetches it.
+        await server.checkpoints.release("rename:Held")
+        _ = try await mutation.value
+        await users.settle()
+        #expect(await server.fetchCount == fetches + 1)
+        #expect(users.data == .init(etag: 2))
+    }
+
+    @Test("refresh during a hold returns at once and fetches once the mutation settles")
+    func refreshHeld() async throws {
+        let (_, users, server) = try await loaded(observed: false)
+        let fetches = await server.fetchCount
+        await server.checkpoints.hold("rename:Held")
+
+        let mutation = Task {
+            try await users.mutate({
+                try await server.rename(id: "1", to: "Held")
+            }, optimistic: renameRow("1", to: "Held"))
+        }
+        await server.checkpoints.reached("rename:Held")
+        await users.refresh()
+        await users.settle()
+        #expect(await server.fetchCount == fetches)
+        #expect(try localUsers(users)["1"] == "Held")
+
+        await server.checkpoints.release("rename:Held")
+        _ = try await mutation.value
+        await users.settle()
+        #expect(await server.fetchCount == fetches + 1)
+        #expect(try localUsers(users)["1"] == "Held")
+    }
+
+    @Test("A mutation's remote call can query the key its own optimistic update covers", .timeLimit(.minutes(1)))
+    func queryInsideMutation() async throws {
+        let (provider, users, server) = try await loaded(observed: false)
+        let seen = try await provider.mutate(invalidates: [.type(TestUser.self)], {
+            try await provider.query(TestUser.self, staleTime: .after(.zero))
+        }, optimistic: { tx in
+            tx.setQueryData(for: TestUser.self) { $0.etag = 99 }
+        })
+        #expect(seen == .init(etag: 99))
+        await users.settle()
+        #expect(users.data == .init(etag: 2))
+        #expect(await server.fetchCount == 2)
+    }
+
+    @Test("A refetch waiting on an in-flight fetch defers when a hold starts meanwhile")
+    func refetchHeldWhileWaiting() async throws {
+        let (provider, users, server) = try await loaded(observed: false)
+        let fetches = await server.fetchCount
+        await server.checkpoints.hold("fetch")
+        let inFlight = Task { await users.refresh() }
+        await server.checkpoints.reached("fetch", count: fetches + 1)
+        let refetch = Task { await provider.refetch(.type(TestUser.self), type: .all) }
+        // The refetch is waiting for the fetch in flight before the hold starts.
+        await eventually { await users.refetchWaits() == 1 }
+
+        await server.checkpoints.hold("rename:Held")
+        let mutation = Task {
+            try await users.mutate({
+                try await server.rename(id: "1", to: "Held")
+            }, optimistic: renameRow("1", to: "Held"))
+        }
+        await server.checkpoints.reached("rename:Held")
+        await users.settleOperations()
+        await server.checkpoints.release("fetch")
+        await inFlight.value
+        await refetch.value
+        await users.settle()
+        #expect(await server.fetchCount == fetches + 1)
+
+        await server.checkpoints.release("rename:Held")
+        _ = try await mutation.value
+        await users.settle()
+        #expect(await server.fetchCount == fetches + 2)
+        #expect(try localUsers(users)["1"] == "Held")
     }
 }

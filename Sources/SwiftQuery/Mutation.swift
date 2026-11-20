@@ -472,7 +472,7 @@ extension QueryProvider {
         guard !filters.isEmpty, let data = try? JSONEncoder().encode(filters) else { return nil }
         let context = bookkeepingContext()
         let key = QueryRecord.Key.marker()
-        context.insert(QueryRecord(key: key, stateData: data))
+        context.insert(QueryRecord(key: key, type: QueryRecord.Key.markerType, stateData: data))
         guard (try? context.save()) != nil else { return nil }
         return key
     }

@@ -67,10 +67,11 @@ struct Benchmarks {
             seed.insert(TestProfile(userID: id, bio: "user \(id)"))
             // An unlisted type's records are deleted without running `evict`.
             let key = operation == .collectGarbageUnlisted
-                ? "Gone.Fetcher:{\"id\":\"\(id)\"}"
+                ? #"["Gone.Fetcher",{"id":""# + id + #""}]"#
                 : QueryRecord.Key.make(TestDetail(id: id))
             seed.insert(QueryRecord(
                 key: key,
+                type: operation == .collectGarbageUnlisted ? "Gone.Fetcher" : String(reflecting: TestDetail.self),
                 stateData: state,
                 lastSyncedAt: .distantPast,
                 tags: QueryRecord.Tags.encode(TestDetail(id: id).tags),

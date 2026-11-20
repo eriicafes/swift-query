@@ -18,6 +18,9 @@ struct QuerySnapshot: Sendable {
     var status: Status
     var fetchStatus: QueryFetchStatus
     var error: (any Error)?
+    /// Changes whenever `error` is set or cleared, so the client can tell a new error from the
+    /// one it shows without comparing errors, which aren't `Equatable`.
+    var errorVersion: UInt64
 }
 
 /// Delays between restarting a stream that ended, and between retries of a stream's failed
@@ -31,7 +34,8 @@ enum StreamBackoff {
 ///
 /// Runs on the global concurrent executor. Its own `ModelContext` is created lazily and used only
 /// for ``QueryRecord`` bookkeeping; each fetch gets a separate fresh context. Keys whose fetcher
-/// has no cache keep their record in memory, unattached to any context, and never save it.
+/// has no cache keep their record in memory, unattached to any context, and never save it. Other
+/// keys do too until they first have state, so a key whose fetch never succeeds stores nothing.
 actor QueryActor<Fetcher: QueryFetcher> {
     typealias Publisher = @Sendable (QuerySnapshot) async -> Void
     typealias Write = @Sendable (inout Fetcher.QueryData) -> Void
@@ -43,17 +47,24 @@ actor QueryActor<Fetcher: QueryFetcher> {
     nonisolated let fetcher: Fetcher
     nonisolated let key: String
     nonisolated let persisted: Bool
-    nonisolated let isModel: Bool
     private let fetchContext: Fetcher.Context
     private let publisher: Publisher
     private let onEvict: EvictHandler
     private var context: ModelContext?
+    /// The record of a key without a cache or without a stored record yet. See ``record()``.
     private var memoryRecord: QueryRecord?
 
     private var loaded = false
     private var status: QuerySnapshot.Status = .pending
     private var fetchStatus: QueryFetchStatus = .idle
-    private var lastError: (any Error)?
+    private var lastError: (any Error)? {
+        didSet {
+            if oldValue != nil || lastError != nil {
+                errorVersion &+= 1
+            }
+        }
+    }
+    private var errorVersion: UInt64 = 0
     private var sequence: UInt64 = 0
 
     private var inFlight: (id: UInt64, task: Task<Void, Never>)?
@@ -75,6 +86,8 @@ actor QueryActor<Fetcher: QueryFetcher> {
     private(set) var fetchJoins = 0
     /// How many fetches started. For tests.
     private(set) var fetchStarts = 0
+    /// How many refetches waited for a fetch in flight. For tests.
+    private(set) var refetchWaits = 0
     /// How many writes and `synced()` calls are waiting for sync. For tests.
     var waitingWrites: Int { syncWaiters.count }
     private var invalidations: UInt64 = 0
@@ -140,7 +153,6 @@ actor QueryActor<Fetcher: QueryFetcher> {
         self.fetcher = fetcher
         self.key = key
         self.persisted = fetcher.cache != nil
-        self.isModel = Fetcher.self is any ModelFetcherKind.Type
         self.modelContainer = modelContainer
         self.fetchContext = fetchContext
         self.publisher = publisher
@@ -200,9 +212,12 @@ actor QueryActor<Fetcher: QueryFetcher> {
         await sync(lastCache ?? defaultCache)
     }
 
-    /// Fetches regardless of freshness, joining an in-flight fetch if there is one.
+    /// Fetches regardless of freshness, joining an in-flight fetch if there is one. While an
+    /// optimistic mutation holds a key that has data, the fetch is deferred until the hold ends
+    /// instead, like a sync's; see ``query(staleTime:)`` for why it isn't awaited.
     func refresh() async {
         loadIfNeeded()
+        if deferFetchIfHeld() { return }
         await startFetch().task.value
     }
 
@@ -222,22 +237,36 @@ actor QueryActor<Fetcher: QueryFetcher> {
     /// like a sync's, so the server's older data can't overwrite the edit.
     func refetch() async {
         loadIfNeeded()
-        if held, case .success = status {
-            deferredFetch = true
-            return
-        }
+        if deferFetchIfHeld() { return }
         if let current = inFlight {
+            refetchWaits += 1
             await current.task.value
             if let next = inFlight, next.id > current.id {
                 await next.task.value
                 return
             }
+            // A hold may have started while waiting.
+            if deferFetchIfHeld() { return }
         }
         await startFetch().task.value
     }
 
+    /// If an optimistic mutation holds a key that has data, asks for a fetch once the hold ends
+    /// and returns `true`, so the caller doesn't fetch.
+    private func deferFetchIfHeld() -> Bool {
+        guard held, case .success = status else { return false }
+        deferredFetch = true
+        return true
+    }
+
     /// Returns the stored state if it is fresh under `staleTime` (or the key's own cache policy
     /// when `nil`), otherwise fetches and returns the result. Throws when that fetch fails.
+    ///
+    /// While an optimistic mutation holds a key that has data, a fetch could return the server's
+    /// data from before the mutation and overwrite the edit, so the current data, which holds the
+    /// edit, is returned and the fetch runs once the hold ends. It isn't awaited: the hold ends
+    /// when the mutation settles, and a mutation whose remote call queries a key it covers would
+    /// otherwise wait for itself.
     func query(staleTime: StaleTime?) async throws -> Data {
         loadIfNeeded()
         let record = try record()
@@ -249,6 +278,9 @@ actor QueryActor<Fetcher: QueryFetcher> {
             case .after(let duration): Date.now.timeIntervalSince(lastSyncedAt) < duration / .seconds(1)
             }
             if fresh { return data }
+        }
+        if deferFetchIfHeld(), case .success(let data, _) = status {
+            return data
         }
         let (id, task) = startFetch()
         await task.value
@@ -270,7 +302,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
     func setQueryData(_ data: Data) async {
         loadIfNeeded()
         do {
-            let record = try record()
+            let record = try recordForWriting()
             let now = Date.now
             record.stateData = data
             record.lastSyncedAt = now
@@ -325,7 +357,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
     /// Replaces the stored data without touching its sync time.
     private func store(_ data: Data, stale: Bool) -> Bool {
         do {
-            try record().stateData = data
+            try recordForWriting().stateData = data
             try save()
             status = .success(data, stale: stale)
             return true
@@ -566,7 +598,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
                 try fetched.context.save()
             }
             let data = fetched.data
-            let record = try record()
+            let record = try recordForWriting()
             let now = Date.now
             record.stateData = data
             record.lastSyncedAt = now
@@ -875,6 +907,7 @@ actor QueryActor<Fetcher: QueryFetcher> {
         // during the write. The data goes first because it can be put back if the rows fail.
         if let changedData {
             if storesData {
+                insertIfNeeded(record)
                 record.stateData = changedData
                 do {
                     try save()
@@ -980,17 +1013,12 @@ actor QueryActor<Fetcher: QueryFetcher> {
         }
     }
 
-    /// A model's record is kept and cleared; a fetcher key's record is deleted.
+    /// Deletes the key's record.
     private func clear(_ record: QueryRecord) {
-        if isModel {
-            record.stateData = nil
-            record.lastSyncedAt = nil
-            record.invalidated = false
-        } else if persisted {
+        if persisted, record.modelContext != nil {
             modelContext.delete(record)
-        } else {
-            memoryRecord = nil
         }
+        memoryRecord = nil
     }
 
     /// Stores the key's tags and cache time, so expiry and tag invalidation work for keys
@@ -1067,28 +1095,40 @@ actor QueryActor<Fetcher: QueryFetcher> {
     }
 
     /// The key's record. Without a unique constraint (which CloudKit forbids), duplicates can
-    /// appear, so extras are removed and the most recently synced one kept. Keys without a
-    /// cache use a record held in memory only.
+    /// appear, so extras are removed and the most recently synced one kept.
+    ///
+    /// Until a write gives the key state, the record is kept in memory only, as it always is for
+    /// a key without a cache, so a key whose fetch never succeeds stores nothing.
     private func record() throws -> QueryRecord {
-        guard persisted else {
-            if let memoryRecord { return memoryRecord }
-            let record = QueryRecord(key: key)
-            memoryRecord = record
-            return record
-        }
-        let records = try modelContext.fetch(QueryRecord.descriptor(key: key))
-        if let keep = QueryRecord.latest(records) {
-            if records.count > 1 {
-                for extra in records where extra !== keep {
-                    modelContext.delete(extra)
+        if persisted {
+            let records = try modelContext.fetch(QueryRecord.descriptor(key: key))
+            if let keep = QueryRecord.latest(records) {
+                if records.count > 1 {
+                    for extra in records where extra !== keep {
+                        modelContext.delete(extra)
+                    }
+                    try modelContext.save()
                 }
-                try modelContext.save()
+                memoryRecord = nil
+                return keep
             }
-            return keep
         }
-        let record = QueryRecord(key: key)
-        modelContext.insert(record)
+        if let memoryRecord { return memoryRecord }
+        let record = QueryRecord(key: key, type: QueryRecord.Key.typeName(Fetcher.self))
+        memoryRecord = record
         return record
+    }
+
+    private func recordForWriting() throws -> QueryRecord {
+        let record = try record()
+        insertIfNeeded(record)
+        return record
+    }
+
+    private func insertIfNeeded(_ record: QueryRecord) {
+        guard persisted, record.modelContext == nil else { return }
+        modelContext.insert(record)
+        memoryRecord = nil
     }
 
     private func publish() async {
@@ -1098,7 +1138,8 @@ actor QueryActor<Fetcher: QueryFetcher> {
                 sequence: sequence,
                 status: status,
                 fetchStatus: fetchStatus,
-                error: lastError
+                error: lastError,
+                errorVersion: errorVersion
             )
         )
     }

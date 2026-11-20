@@ -26,8 +26,10 @@ public protocol Queryable {}
 /// `Context` and `QueryData` are inferred from `fetch`. `QueryData` never needs to be optional:
 /// "nothing fetched yet" is `QueryState.pending`. Keep the synthesized `Hashable` and
 /// `Codable` conformances: equality picks the client and the JSON encoding names the stored
-/// record, so the two must agree. Changing a fetcher's stored properties changes its keys; records
-/// stored under old keys are deleted without ``evict(query:)``.
+/// record, so the two must agree. `Set` and dictionary properties are encoded in a fixed order;
+/// a custom `encode(to:)` that iterates one itself must sort it. Changing a fetcher's stored
+/// properties changes its keys; at the next launch, records stored under old keys are deleted
+/// without ``evict(query:)``, so rows they wrote stay unless a current key's fetch replaces them.
 public protocol QueryFetcher: Queryable, Hashable, Codable, Sendable {
     /// Runtime dependencies, resolved by type from the provider's `contexts:`.
     associatedtype Context: Sendable

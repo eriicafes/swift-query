@@ -1,6 +1,13 @@
 import Foundation
 import Observation
 import SwiftData
+#if os(watchOS)
+import WatchKit
+#elseif canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
 /// The application-level registry for synced models and fetchers.
 ///
@@ -20,8 +27,9 @@ import SwiftData
 ///   up by type; to satisfy a protocol-typed context, cast the value: `client as any HTTPClient`.
 ///   A context type conforming to ``DefaultFetchContext`` (and `Void`) needs no registration.
 /// - `fetchers:` lists every persisted model and fetcher type, so the provider can evict their
-///   expired caches even when no client exists. Fetchers whose `cache` is `nil` need not be
-///   listed. The list doesn't restrict which keys can be used.
+///   expired caches even when no client exists. At launch, stored records of types that aren't
+///   listed are deleted, so a persisted type must be listed for its cache to survive a relaunch;
+///   debug builds assert when one isn't. Fetchers whose `cache` is `nil` need not be listed.
 /// - `recoversInterruptedMutations` invalidates, at launch, the keys of optimistic mutations that
 ///   never settled because the app was terminated. Pass `false` for a provider that shares its
 ///   store with another one running at the same time, such as in an app extension, so it doesn't
@@ -59,7 +67,7 @@ public final class QueryProvider {
     /// How many entries `clients` had after the last prune.
     @ObservationIgnored private var prunedClientCount = 0
     /// Does bulk work on stored records off the main actor.
-    @ObservationIgnored private let store: RecordStore
+    @ObservationIgnored private let store: QueryRecordStore
     /// The first delay before restarting a stream that ended, or retrying its failed `begin()`
     /// fetch. Applies to clients created afterwards. Shortened by tests.
     @ObservationIgnored var streamBackoff = StreamBackoff.initial
@@ -72,6 +80,8 @@ public final class QueryProvider {
     /// Keys that expired when they were next used, waiting to invalidate the keys sharing their tags.
     @ObservationIgnored private var expiredBatch = Evicted()
     @ObservationIgnored private var expiryFlush: Task<Void, Never>?
+    /// Sweeps when the app goes to the background.
+    @ObservationIgnored private var backgroundObservation: NotificationObservation?
 
     public init<each Context: Sendable>(
         modelContainer: ModelContainer,
@@ -96,9 +106,10 @@ public final class QueryProvider {
         var registered: [ObjectIdentifier: Any] = [:]
         repeat Self.register(each contexts, into: &registered)
         self.contexts = registered
-        self.store = RecordStore(
+        self.store = QueryRecordStore(
             container: modelContainer,
-            evictors: entries.mapValues { $0.evictor(registered) }
+            evictors: entries.mapValues { $0.evictor(registered) },
+            keyChecks: entries.mapValues(\.keyCheck)
         )
         // Fail at launch, not on first use, when a listed type's context is missing.
         for entry in entries.values {
@@ -108,8 +119,30 @@ public final class QueryProvider {
         if recoversInterruptedMutations {
             recoverPendingMutations()
         }
-        // Clean up data that expired since the last launch.
-        scheduleGarbageCollection()
+        // Clean up what expired or became unreachable since the last launch, then expired data
+        // whenever the app goes to the background.
+        scheduleGarbageCollection(includingOrphans: true)
+        observeBackground(on: .default)
+    }
+
+    /// Sweeps whenever `center` posts ``backgroundNotification``, replacing any earlier
+    /// observation. Tests pass their own center, so posting doesn't sweep other providers.
+    func observeBackground(on center: NotificationCenter) {
+        backgroundObservation = NotificationObservation(Self.backgroundNotification, center: center) { [weak self] in
+            self?.scheduleGarbageCollection()
+        }
+    }
+
+    /// Posted when the app goes to the background: when it leaves the screen on iOS, iPadOS,
+    /// tvOS, visionOS and watchOS, and when another app becomes active on macOS.
+    static var backgroundNotification: Notification.Name {
+        #if os(watchOS)
+        WKApplication.didEnterBackgroundNotification
+        #elseif canImport(UIKit)
+        UIApplication.didEnterBackgroundNotification
+        #elseif canImport(AppKit)
+        NSApplication.didResignActiveNotification
+        #endif
     }
 
     // MARK: Contexts
@@ -149,14 +182,15 @@ public final class QueryProvider {
             return existing
         }
         let key = QueryRecord.Key.make(fetcher)
-        if fetcher.cache != nil, entries[QueryRecord.Key.typeName(of: key)] == nil {
+        let typeName = QueryRecord.Key.typeName(F.self)
+        if fetcher.cache != nil, entries[typeName] == nil {
             assertionFailure(
-                "`\(QueryRecord.Key.typeName(of: key))` is persisted but not listed in `fetchers:`, so its expired cache is never evicted"
+                "`\(typeName)` is persisted but not listed in `fetchers:`, so its expired cache is never evicted"
             )
         }
         // A store write still running for this key must land before the client reads its record.
         let tags = fetcher.tags
-        let pending = pendingStoreWrites.values.filter { $0.covers(key: key, tags: tags) }
+        let pending = pendingStoreWrites.values.filter { $0.covers(key: key, type: typeName, tags: tags) }
         let gate: Task<Void, Never>? = pending.isEmpty ? nil : Task {
             for write in pending {
                 await write.task.value
@@ -231,12 +265,12 @@ public final class QueryProvider {
 
     @ObservationIgnored private var garbageCollection: Task<Void, Never>?
 
-    /// Starts a garbage collection sweep unless one is already running. Runs at launch and when
-    /// the app goes to the background.
-    func scheduleGarbageCollection() {
+    /// Starts a garbage collection sweep unless one is already running. Runs at launch, including
+    /// orphaned records, and when the app goes to the background (see ``backgroundNotification``).
+    func scheduleGarbageCollection(includingOrphans: Bool = false) {
         guard garbageCollection == nil else { return }
         garbageCollection = Task { [weak self] in
-            await self?.collectGarbage()
+            await self?.collectGarbage(includingOrphans: includingOrphans)
             self?.garbageCollection = nil
         }
     }
@@ -306,6 +340,9 @@ public final class QueryProvider {
     /// `staleTime` overrides how old the cached state may be: `nil` uses the key's own cache
     /// policy, `.infinite` accepts any cached state, `.after(.zero)` always fetches. Joins a fetch
     /// already in flight. Throws when the fetch fails.
+    ///
+    /// While an optimistic mutation covering the key is in flight and the key has data, returns
+    /// that data, which holds the mutation's edit, and fetches once the mutation settles.
     @discardableResult
     public func query<F: QueryFetcher>(_ fetcher: F, staleTime: StaleTime? = nil) async throws -> F.QueryData {
         try await client(for: fetcher).query(staleTime: staleTime)
@@ -388,7 +425,9 @@ public final class QueryProvider {
     /// held: syncs from views don't fetch them if they have data, and when another mutation
     /// settles, their refetch waits until no in-flight optimistic mutation covers them. So the
     /// server's older data can't overwrite the edit. ``QueryObserver/refresh()`` and
-    /// ``query(_:staleTime:)-(F,_)`` still fetch.
+    /// ``query(_:staleTime:)-(F,_)`` defer their fetch the same way: `query` returns the data
+    /// holding the edit, and neither waits for the mutation, so a remote call can query the keys
+    /// its own mutation covers.
     ///
     /// ### Scopes
     ///
@@ -481,13 +520,18 @@ public final class QueryProvider {
     }
 
     /// Evicts expired SWR caches of live clients that are unobserved and idle, and of every
-    /// stored key without a client, using each record's stored cache time. Records of types no
-    /// longer listed are deleted (a model's is cleared) without `evict`; `.forever` records are
-    /// kept.
+    /// stored key without a client, using each record's stored cache time. Expired records of
+    /// types no longer listed are deleted without `evict`.
     ///
     /// The provider already runs this at launch and whenever the app goes to the background;
-    /// call it yourself only to clean up at another time.
+    /// call it yourself only to clean up at another time. At launch it also deletes records no
+    /// client can use again: those of types not listed in `fetchers:`, and those stored before
+    /// their fetcher's stored properties changed.
     public func collectGarbage() async {
+        await collectGarbage(includingOrphans: false)
+    }
+
+    func collectGarbage(includingOrphans: Bool) async {
         var evicted = Evicted()
         for client in liveClients where await client.collectGarbage() {
             evicted.add(client.recordKey, tags: client.tagSet)
@@ -499,13 +543,31 @@ public final class QueryProvider {
             await store.expiredKeys(except: liveKeys, now: now)
         }
         let live = liveKeys
-        let expired = found.filter { !live.contains($0) }
+        let expired = found.filter { !live.contains($0.key) }
         if !expired.isEmpty {
-            evicted.formUnion(await writeStore(covering: expired.map(QueryFilter.init(key:)), evicts: true) { store in
-                await store.evictExpired(expired, now: now)
+            let keys = expired.map(\.key)
+            evicted.formUnion(await writeStore(covering: expired.map(\.keyFilter), evicts: true) { store in
+                await store.evictExpired(keys, now: now)
             })
         }
         await invalidateShared(evicted)
+        if includingOrphans {
+            await deleteOrphans()
+        }
+    }
+
+    /// Deletes records no client can use again, as a write covering only those keys.
+    private func deleteOrphans() async {
+        let found = await readStore { [liveKeys] store in
+            await store.orphanedKeys(except: liveKeys)
+        }
+        let live = liveKeys
+        let orphans = found.filter { !live.contains($0.key) }
+        guard !orphans.isEmpty else { return }
+        let keys = orphans.map(\.key)
+        await writeStore(covering: orphans.map(\.keyFilter), evicts: true) { store in
+            await store.deleteOrphans(keys)
+        }
     }
 
     // MARK: Matching
@@ -513,7 +575,7 @@ public final class QueryProvider {
     /// Live clients matching any of `filters`, each once.
     private func liveClients(matching filters: [QueryFilter]) -> [any AnyQueryObserver] {
         liveClients.filter { client in
-            filters.contains { $0.matches(key: client.recordKey, tags: client.tagSet) }
+            filters.contains { $0.matches(key: client.recordKey, type: client.typeName, tags: client.tagSet) }
         }
     }
 
@@ -546,7 +608,7 @@ public final class QueryProvider {
     // MARK: Store queue
 
     /// Runs `work` on the record store after every store operation queued before it.
-    private func readStore<T: Sendable>(_ work: @escaping @Sendable (RecordStore) async -> T) async -> T {
+    private func readStore<T: Sendable>(_ work: @escaping @Sendable (QueryRecordStore) async -> T) async -> T {
         await writeStore(covering: [], evicts: false, work)
     }
 
@@ -556,7 +618,7 @@ public final class QueryProvider {
     private func writeStore<T: Sendable>(
         covering filters: [QueryFilter],
         evicts: Bool,
-        _ work: @escaping @Sendable (RecordStore) async -> T
+        _ work: @escaping @Sendable (QueryRecordStore) async -> T
     ) async -> T {
         let previous = storeTail
         let store = store
@@ -631,7 +693,7 @@ public final class QueryProvider {
     /// Whether an optimistic mutation whose remote call hasn't returned covers the client's key.
     func isCovered(_ client: any AnyQueryObserver) -> Bool {
         optimisticFilters.values.contains { filters in
-            filters.contains { $0.matches(key: client.recordKey, tags: client.tagSet) }
+            filters.contains { $0.matches(key: client.recordKey, type: client.typeName, tags: client.tagSet) }
         }
     }
 
@@ -716,9 +778,9 @@ public final class QueryProvider {
         let keys = await readStore { store in
             await store.keysWithState(matching: filters, except: excluded)
         }
-        return keys.compactMap { key in
-            guard let entry = entries[QueryRecord.Key.typeName(of: key)] else { return nil }
-            return { await entry.refresh(key, self) }
+        return keys.compactMap { stored in
+            guard let entry = entries[stored.type] else { return nil }
+            return { await entry.refresh(stored.key, self) }
         }
     }
 
@@ -803,7 +865,7 @@ struct PendingStoreWrite {
         var keys = Set<String>()
         var others: [QueryFilter] = []
         for filter in filters {
-            if case .key(let key) = filter.selector {
+            if case .key(let key, _) = filter.selector {
                 keys.insert(key)
             } else {
                 others.append(filter)
@@ -817,8 +879,8 @@ struct PendingStoreWrite {
 
     /// Whether the write covers the key. Key filters are looked up, so a garbage-collection sweep
     /// over many keys doesn't slow down creating clients.
-    func covers(key: String, tags: Set<String>) -> Bool {
-        keys.contains(key) || filters.contains { $0.matches(key: key, tags: tags) }
+    func covers(key: String, type: String, tags: Set<String>) -> Bool {
+        keys.contains(key) || filters.contains { $0.matches(key: key, type: type, tags: tags) }
     }
 }
 
@@ -829,9 +891,11 @@ struct FetcherEntry {
     let validate: @MainActor (QueryProvider) -> Void
     /// Makes the evictor from the registered contexts: it decodes the key and runs the type's
     /// `evict`, doing nothing if the key no longer decodes.
-    let evictor: (_ contexts: [ObjectIdentifier: Any]) -> RecordStore.Evictor
+    let evictor: (_ contexts: [ObjectIdentifier: Any]) -> QueryRecordStore.Evictor
     /// Creates a client for the key and refreshes it.
     let refresh: @MainActor (_ key: String, _ provider: QueryProvider) async -> Void
+    /// Whether the type still produces a key; see ``QueryRecordStore/KeyCheck``.
+    let keyCheck: QueryRecordStore.KeyCheck
 
     static func make(_ type: any Queryable.Type) -> FetcherEntry {
         if let model = type as? any QueryModel.Type {
@@ -849,7 +913,7 @@ struct FetcherEntry {
 
     private static func entry<F: QueryFetcher>(for _: F.Type) -> FetcherEntry {
         FetcherEntry(
-            name: (F.self as? any ModelFetcherKind.Type)?.modelTypeName ?? String(reflecting: F.self),
+            name: QueryRecord.Key.typeName(F.self),
             validate: { provider in _ = provider.fetchContext(F.Context.self) },
             evictor: { contexts in
                 let fetchContext = QueryProvider.fetchContext(F.Context.self, in: contexts)
@@ -863,8 +927,28 @@ struct FetcherEntry {
                 await provider.client(for: fetcher).refetchIfFetched()
                 // Created only for this fetch, so it isn't kept for the keep-alive time.
                 provider.releaseIfIdle(fetcher)
+            },
+            keyCheck: { key in
+                QueryRecord.Key.decode(F.self, from: key).map(QueryRecord.Key.make) == key
             }
         )
+    }
+}
+
+/// A block observer for a notification, removed when this is released.
+final class NotificationObservation: @unchecked Sendable {
+    private let center: NotificationCenter
+    private let token: any NSObjectProtocol
+
+    init(_ name: Notification.Name, center: NotificationCenter, handler: @escaping @MainActor () -> Void) {
+        self.center = center
+        token = center.addObserver(forName: name, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { handler() }
+        }
+    }
+
+    deinit {
+        center.removeObserver(token)
     }
 }
 
@@ -888,7 +972,8 @@ final class WeakClient {
 /// ```
 public struct QueryFilter: Hashable, Sendable, Codable {
     enum Selector: Hashable, Sendable, Codable {
-        case key(String)
+        /// A record key, with its type's name, so it can be compared with type filters.
+        case key(String, type: String)
         case type(String)
         case tag(String)
         case all
@@ -896,9 +981,9 @@ public struct QueryFilter: Hashable, Sendable, Codable {
 
     let selector: Selector
 
-    /// One record key.
-    init(key: String) {
-        selector = .key(key)
+    /// One record key of the type named `type`.
+    init(key: String, type: String) {
+        selector = .key(key, type: type)
     }
 
     init(selector: Selector) {
@@ -907,13 +992,13 @@ public struct QueryFilter: Hashable, Sendable, Codable {
 
     /// One fetcher key.
     public static func key<F: QueryFetcher>(_ fetcher: F) -> QueryFilter {
-        QueryFilter(selector: .key(QueryRecord.Key.make(fetcher)))
+        QueryFilter(key: QueryRecord.Key.make(fetcher), type: QueryRecord.Key.typeName(F.self))
     }
 
     /// The key a client syncs.
     @MainActor
     public static func key<F>(_ client: QueryObserver<F>) -> QueryFilter {
-        QueryFilter(selector: .key(client.recordKey))
+        QueryFilter(key: client.recordKey, type: client.typeName)
     }
 
     /// A model's collection, or every key of a fetcher type.
@@ -935,21 +1020,19 @@ public struct QueryFilter: Hashable, Sendable, Codable {
     /// `.all` may match anything, since a filter alone doesn't say which keys a tag covers.
     func overlaps(_ other: QueryFilter) -> Bool {
         switch (selector, other.selector) {
-        case (.key(let a), .key(let b)), (.type(let a), .type(let b)):
+        case (.key(let a, _), .key(let b, _)), (.type(let a), .type(let b)):
             a == b
-        case (.key(let key), .type):
-            other.matches(key: key, tags: [])
-        case (.type, .key(let key)):
-            matches(key: key, tags: [])
+        case (.key(_, let type), .type(let name)), (.type(let name), .key(_, let type)):
+            type == name
         default:
             true
         }
     }
 
-    func matches(key: String, tags: Set<String>) -> Bool {
+    func matches(key: String, type: String, tags: Set<String>) -> Bool {
         switch selector {
-        case .key(let match): key == match
-        case .type(let name): key == name || key.hasPrefix(name + ":")
+        case .key(let match, _): key == match
+        case .type(let name): type == name
         case .tag(let tag): tags.contains(tag)
         case .all: true
         }
@@ -957,11 +1040,10 @@ public struct QueryFilter: Hashable, Sendable, Codable {
 
     func descriptor() -> FetchDescriptor<QueryRecord> {
         switch selector {
-        case .key(let key):
+        case .key(let key, _):
             return QueryRecord.descriptor(key: key)
         case .type(let name):
-            let prefix = name + ":"
-            return FetchDescriptor(predicate: #Predicate { $0.key == name || $0.key.starts(with: prefix) })
+            return FetchDescriptor(predicate: #Predicate { $0.type == name })
         case .tag(let tag):
             let needle = QueryRecord.Tags.needle(tag)
             return FetchDescriptor(predicate: #Predicate { $0.tags.contains(needle) })
@@ -973,13 +1055,10 @@ public struct QueryFilter: Hashable, Sendable, Codable {
     /// ``descriptor()`` limited to records that have state, checked by the store.
     func descriptorWithState() -> FetchDescriptor<QueryRecord> {
         switch selector {
-        case .key(let key):
+        case .key(let key, _):
             return FetchDescriptor(predicate: #Predicate { $0.key == key && $0.stateData != nil })
         case .type(let name):
-            let prefix = name + ":"
-            return FetchDescriptor(predicate: #Predicate {
-                ($0.key == name || $0.key.starts(with: prefix)) && $0.stateData != nil
-            })
+            return FetchDescriptor(predicate: #Predicate { $0.type == name && $0.stateData != nil })
         case .tag(let tag):
             let needle = QueryRecord.Tags.needle(tag)
             return FetchDescriptor(predicate: #Predicate { $0.tags.contains(needle) && $0.stateData != nil })

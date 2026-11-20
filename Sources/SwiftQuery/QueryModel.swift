@@ -74,8 +74,8 @@ public struct ModelFetcher<Model: QueryModel>: QueryFetcher {
     }
 }
 
-/// Marks model fetchers, whose record key is the model's type name and whose clients live for
-/// the whole session.
+/// Marks model fetchers, whose record key holds only the model's type name and whose clients
+/// live for the whole session.
 protocol ModelFetcherKind {
     static var modelTypeName: String { get }
 }

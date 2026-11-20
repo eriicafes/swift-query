@@ -292,7 +292,7 @@ struct UserView: View {
 Fetchers work like models, with two differences:
 
 - `cache` is a property of the value, so it can depend on it. Return `nil` to keep the query data in memory only, for the current session.
-- A fetcher must be `Hashable` and `Codable`. Keep the conformances Swift generates: they identify the fetcher in memory and in storage.
+- A fetcher must be `Hashable` and `Codable`. Keep the conformances Swift generates: they identify the fetcher in memory and in storage. `Set` properties are fine: they're saved in a fixed order.
 
 Have a fetcher create or update the row from its own response rather than assume the row already exists. Then it also works when the screen is opened directly, for example from a deep link, before the full list has loaded.
 
@@ -370,7 +370,7 @@ Only delete rows that came from the server and that nothing else shows.
 
 SwiftQuery cleans up expired data automatically: when it's next used, once when the app launches, and whenever the app goes to the background. To clean up at another time, call `provider.collectGarbage()`.
 
-This is what `fetchers:` is for: the provider can only clean up types it knows about, so list every model and fetcher you persist. A debug build stops with an assertion if you use a persisted type that isn't listed. Fetchers with `cache: nil` don't need to be listed.
+This is what `fetchers:` is for: the provider can only clean up types it knows about, so list every model and fetcher you persist. At launch, saved data of types that aren't listed is deleted, along with data saved under a fetcher's old shape, after you change its stored properties. Rows that data wrote are kept, since there's no `evict` to run for it. A debug build stops with an assertion if you use a persisted type that isn't listed. Fetchers with `cache: nil` don't need to be listed.
 
 What a fetcher should clean up depends on what it writes:
 
@@ -527,7 +527,7 @@ try await profileClient.mutate {
 - If the request succeeds, the changes stay until the data is fetched again.
 - If it fails, the undo closures run (newest first), query data is put back, and the error is thrown to you. Query data is only put back if nothing, such as a fetch, has changed it since. If a newer optimistic mutation may have changed the same data since, the undo closures don't run now, so they can't undo the newer change. While the newer one's request is in flight, they wait for it: if it fails too, they run after its own; if it succeeds, they're dropped. Either way the data is fetched again. A newer mutation counts when it invalidates overlapping data: the same key or type, or any tag or `.all`. Sharing a scope doesn't count, so scoped mutations that change the same rows should list them in `invalidates`. A mutation that invalidates nothing never counts, and its undo closures always run.
 - `setQueryData` stops a fetch of that data in progress, so an older response can't overwrite the change, and the data is invalidated when the mutation finishes. A `provider.query` waiting on that fetch gets the updated value.
-- While the request is in flight, the data it invalidates isn't fetched by views or by other mutations finishing, so the server's older data can't overwrite the change. Pull-to-refresh and `provider.query` still fetch.
+- While the request is in flight, the data it invalidates isn't fetched by views or by other mutations finishing, so the server's older data can't overwrite the change. Pull-to-refresh and `provider.query` wait too: `refresh()` returns right away, and `provider.query` returns the changed data. The data is fetched once the request finishes.
 - Once a request is sent, cancelling the task that called `mutate` doesn't cancel it.
 - If the app is quit before a mutation finishes, the data it would have invalidated is fetched again at the next launch, so an optimistic change the server never confirmed doesn't stay. If an app extension creates its own provider on the same store, pass `recoversInterruptedMutations: false` to it, so it doesn't mistake the app's mutations in progress for interrupted ones.
 

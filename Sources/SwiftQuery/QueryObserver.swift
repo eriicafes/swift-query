@@ -34,9 +34,11 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
     public let modelContainer: ModelContainer
 
     @ObservationIgnored let recordKey: String
+    @ObservationIgnored let typeName: String
     @ObservationIgnored private let actor: QueryActor<Fetcher>
     @ObservationIgnored private var tail: Task<Void, Never>?
     @ObservationIgnored private var lastSequence: UInt64 = 0
+    @ObservationIgnored private var errorVersion: UInt64 = 0
     @ObservationIgnored private var stateData: Data?
     /// Optimistic edits shown here that the actor hasn't stored yet.
     @ObservationIgnored private var optimisticWrites = 0
@@ -66,6 +68,7 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
         let sink = SnapshotSink<Fetcher>()
         self.fetcher = fetcher
         self.recordKey = recordKey
+        self.typeName = QueryRecord.Key.typeName(Fetcher.self)
         self.modelContainer = modelContainer
         self.provider = provider
         self.actor = QueryActor(
@@ -130,6 +133,10 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
     }
 
     /// Fetches regardless of freshness. Joins an in-flight fetch instead of starting another.
+    ///
+    /// While an optimistic mutation covering the key is in flight and the key has data, the
+    /// fetch runs once the mutation settles instead, so the server's older data can't overwrite
+    /// the edit, and this returns right away.
     public func refresh() async {
         await tail?.value
         await actor.refresh()
@@ -204,10 +211,11 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
     func applyOptimistic(_ update: @escaping QueryActor<Fetcher>.Write) -> (@MainActor () async -> Void)? {
         guard var value = state.data else { return nil }
         update(&value)
-        if let data = try? JSONEncoder().encode(value) {
-            stateData = data
-            state = .success(data: value, stale: state.isStale)
-        }
+        // Data that can't be encoded can't be stored either; leave the key untouched rather than
+        // show an edit the actor will reject.
+        guard let data = try? JSONEncoder().encode(value) else { return nil }
+        stateData = data
+        state = .success(data: value, stale: state.isStale)
         let previous = tail
         let actor = actor
         let write = Task {
@@ -355,6 +363,11 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
         await actor.fetchStarts
     }
 
+    /// How many refetches waited for a fetch in flight.
+    func refetchWaits() async -> Int {
+        await actor.refetchWaits
+    }
+
     /// How many writes are waiting for the stream to sync.
     func waitingWrites() async -> Int {
         await actor.waitingWrites
@@ -381,7 +394,9 @@ public final class QueryObserver<Fetcher: QueryFetcher> {
             fetchStatus = snapshot.fetchStatus
             activityChanged()
         }
-        if snapshot.error != nil || error != nil {
+        // Assigned only when the actor's error changed, since every assignment notifies views.
+        if snapshot.errorVersion != errorVersion {
+            errorVersion = snapshot.errorVersion
             error = snapshot.error
         }
     }
@@ -467,6 +482,7 @@ private final class SnapshotSink<Fetcher: QueryFetcher> {
 @MainActor
 protocol AnyQueryObserver: AnyObject {
     var recordKey: String { get }
+    var typeName: String { get }
     var tagSet: Set<String> { get }
     var isActive: Bool { get }
     var isObserved: Bool { get }

@@ -18,8 +18,11 @@ import SwiftData
 /// ```
 @Model
 public final class QueryRecord {
-    /// The model type's identity.
+    /// The key's identity: its type's name, and for a fetcher its value. See ``type``.
     public var key: String = ""
+    /// The name of the key's model or fetcher type. Type filters and garbage collection find a
+    /// key's type here, never by parsing ``key``.
+    public var type: String = ""
     /// The encoded ``QueryFetcher/QueryData`` from the last successful fetch.
     public var stateData: Data?
     /// When the last successful fetch finished.
@@ -35,6 +38,7 @@ public final class QueryRecord {
 
     public init(
         key: String,
+        type: String,
         stateData: Data? = nil,
         lastSyncedAt: Date? = nil,
         lastAccessedAt: Date? = nil,
@@ -43,6 +47,7 @@ public final class QueryRecord {
         gcTime: Double? = nil
     ) {
         self.key = key
+        self.type = type
         self.stateData = stateData
         self.lastSyncedAt = lastSyncedAt
         self.lastAccessedAt = lastAccessedAt
@@ -66,33 +71,40 @@ extension QueryRecord {
 }
 
 extension QueryRecord {
-    /// Whether the record's cache expired under its stored ``gcTime``.
-    func isExpired(now: Date) -> Bool {
-        guard let gcTime, stateData != nil,
-              let lastUse = lastAccessedAt ?? lastSyncedAt
-        else { return false }
-        return now >= lastUse.addingTimeInterval(gcTime)
-    }
-}
-
-extension QueryRecord {
-    /// Record keys: a model's type name, or a fetcher's type name and its value as sorted JSON.
+    /// Record keys: a JSON array of the key's type name and, for a fetcher, its value, written
+    /// by ``QueryRecordKeyEncoder`` so unordered collections are in canonical order:
+    ///
+    /// ```
+    /// ["MyApp.UserDetail",{"id":"42"}]   // a fetcher
+    /// ["MyApp.User"]                     // a model
+    /// ```
+    ///
+    /// JSON quotes and escapes the type name, so it ends exactly where the string does, whatever
+    /// characters it contains: two different types or values can never share a key. A key is
+    /// only compared whole or decoded by the type it names; type filters use the name stored on
+    /// its own in ``QueryRecord/type``.
     enum Key {
         static func make<F: QueryFetcher>(_ fetcher: F) -> String {
-            if let model = F.self as? any ModelFetcherKind.Type {
-                return model.modelTypeName
-            }
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-            guard let data = try? encoder.encode(fetcher) else {
+            // A model's fetcher has no value of its own: the model type is the key.
+            let value = F.self is any ModelFetcherKind.Type ? nil : fetcher
+            guard let data = try? QueryRecordKeyEncoder.encode(Parts(type: typeName(F.self), value: value)) else {
                 preconditionFailure("Couldn't encode the fetcher \(fetcher) to build its record key")
             }
-            return "\(String(reflecting: F.self)):\(String(decoding: data, as: UTF8.self))"
+            return String(decoding: data, as: UTF8.self)
         }
 
-        /// The prefix of a pending mutation marker's key. `#` can't start a type name, so no
-        /// listed type or filter matches it.
+        /// The name of a fetcher's type, stored as ``QueryRecord/type``: the model's type name for
+        /// a model, the fetcher's otherwise.
+        static func typeName<F: QueryFetcher>(_: F.Type) -> String {
+            (F.self as? any ModelFetcherKind.Type)?.modelTypeName ?? String(reflecting: F.self)
+        }
+
+        /// The prefix of a pending mutation marker's key. Keys start with `[`, so none starts
+        /// with this.
         static let markerPrefix = "#pending:"
+
+        /// A marker's ``QueryRecord/type``, which no type filter names.
+        static let markerType = "#pending"
 
         /// A new pending mutation marker's key.
         static func marker() -> String {
@@ -103,20 +115,45 @@ extension QueryRecord {
             key.hasPrefix(markerPrefix)
         }
 
-        static func typeName(of key: String) -> String {
-            key.firstIndex(of: ":").map { String(key[..<$0]) } ?? key
-        }
-
-        static func isModel(_ key: String) -> Bool {
-            !key.contains(":")
-        }
-
+        /// The fetcher a key of type `F` names, or `nil` if the key belongs to another type or
+        /// no longer decodes as `F`.
         static func decode<F: QueryFetcher>(_: F.Type, from key: String) -> F? {
+            guard let parts = try? JSONDecoder().decode(Parts<F>.self, from: Data(key.utf8)),
+                  parts.type == typeName(F.self)
+            else { return nil }
             if F.self is any ModelFetcherKind.Type {
+                guard parts.value == nil else { return nil }
                 return try? JSONDecoder().decode(F.self, from: Data("{}".utf8))
             }
-            guard let colon = key.firstIndex(of: ":") else { return nil }
-            return try? JSONDecoder().decode(F.self, from: Data(key[key.index(after: colon)...].utf8))
+            return parts.value
+        }
+
+        /// A key's contents: `[type]` or `[type, value]`.
+        private struct Parts<Value: Codable>: Codable {
+            let type: String
+            let value: Value?
+
+            init(type: String, value: Value?) {
+                self.type = type
+                self.value = value
+            }
+
+            init(from decoder: any Decoder) throws {
+                var container = try decoder.unkeyedContainer()
+                type = try container.decode(String.self)
+                value = container.isAtEnd ? nil : try container.decode(Value.self)
+                guard container.isAtEnd else {
+                    throw DecodingError.dataCorruptedError(in: container, debugDescription: "A record key has at most two elements")
+                }
+            }
+
+            func encode(to encoder: any Encoder) throws {
+                var container = encoder.unkeyedContainer()
+                try container.encode(type)
+                if let value {
+                    try container.encode(value)
+                }
+            }
         }
     }
 

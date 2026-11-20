@@ -372,7 +372,9 @@ struct TestDefaulted: QueryFetcher {
 
 extension QueryModel {
     /// The model's record key.
-    static var queryKey: String { String(reflecting: Self.self) }
+    static var queryKey: String { QueryRecord.Key.make(ModelFetcher<Self>()) }
+    /// The model's stored type name.
+    static var queryType: String { String(reflecting: Self.self) }
 }
 
 /// Counts how many times ``CountedValue`` is decoded.

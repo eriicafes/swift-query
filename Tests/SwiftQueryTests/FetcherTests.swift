@@ -40,12 +40,20 @@ struct FetcherTests {
 
     // MARK: Keys
 
-    @Test("Record keys are the type name, plus the fetcher as sorted JSON")
+    @Test("Record keys are a JSON array of the type name and, for a fetcher, its value with sorted keys")
     func recordKeys() {
-        #expect(QueryRecord.Key.make(ModelFetcher<TestUser>()) == String(reflecting: TestUser.self))
-        #expect(QueryRecord.Key.make(TestDetail(id: "42")) == String(reflecting: TestDetail.self) + #":{"id":"42"}"#)
-        #expect(QueryRecord.Key.make(TestRate(from: "USD", to: "EUR")) == String(reflecting: TestRate.self) + #":{"from":"USD","to":"EUR"}"#)
+        let user = String(reflecting: TestUser.self)
+        let detail = String(reflecting: TestDetail.self)
+        let rate = String(reflecting: TestRate.self)
+        #expect(QueryRecord.Key.make(ModelFetcher<TestUser>()) == #"[""# + user + #""]"#)
+        #expect(QueryRecord.Key.make(TestDetail(id: "42")) == #"[""# + detail + #"",{"id":"42"}]"#)
+        #expect(QueryRecord.Key.make(TestRate(from: "USD", to: "EUR")) == #"[""# + rate + #"",{"from":"USD","to":"EUR"}]"#)
         #expect(QueryRecord.Key.decode(TestDetail.self, from: QueryRecord.Key.make(TestDetail(id: "42"))) == TestDetail(id: "42"))
+        #expect(QueryRecord.Key.decode(ModelFetcher<TestUser>.self, from: QueryRecord.Key.make(ModelFetcher<TestUser>())) != nil)
+        // A key only decodes as the type it names.
+        #expect(QueryRecord.Key.decode(ModelFetcher<TestPost>.self, from: QueryRecord.Key.make(ModelFetcher<TestUser>())) == nil)
+        #expect(QueryRecord.Key.decode(TestDetail.self, from: QueryRecord.Key.make(ModelFetcher<TestUser>())) == nil)
+        #expect(QueryRecord.Key.decode(ModelFetcher<TestUser>.self, from: #"[""# + user + #"",{}]"#) == nil)
     }
 
     @Test("Tags with commas and percent signs match exactly")
@@ -55,9 +63,9 @@ struct FetcherTests {
 
         let (provider, _, _) = try makeProvider()
         let context = ModelContext(provider.modelContainer)
-        context.insert(QueryRecord(key: "x", tags: QueryRecord.Tags.encode(["a,b"])))
-        context.insert(QueryRecord(key: "y", tags: QueryRecord.Tags.encode(["a"])))
-        context.insert(QueryRecord(key: "z", tags: QueryRecord.Tags.encode(["A"])))
+        context.insert(QueryRecord(key: "x", type: "T", tags: QueryRecord.Tags.encode(["a,b"])))
+        context.insert(QueryRecord(key: "y", type: "T", tags: QueryRecord.Tags.encode(["a"])))
+        context.insert(QueryRecord(key: "z", type: "T", tags: QueryRecord.Tags.encode(["A"])))
         try context.save()
 
         await provider.invalidate(.tag("a"))
@@ -152,7 +160,7 @@ struct FetcherTests {
         await provider.client(for: TestDetail(id: "2")).settle()
         let stored = QueryRecord.Key.make(TestDetail(id: "3"))
         let context = ModelContext(provider.modelContainer)
-        context.insert(QueryRecord(key: stored, stateData: Data("{}".utf8), lastSyncedAt: .now, tags: QueryRecord.Tags.encode(["users"])))
+        context.insert(QueryRecord(key: stored, type: String(reflecting: TestDetail.self), stateData: Data("{}".utf8), lastSyncedAt: .now, tags: QueryRecord.Tags.encode(["users"])))
         try context.save()
         let fetches = await server.fetchCount
 
@@ -221,7 +229,8 @@ struct FetcherTests {
         let stored = QueryRecord.Key.make(TestDetail(id: "3"))
         let context = ModelContext(provider.modelContainer)
         context.insert(QueryRecord(
-            key: stored, stateData: try JSONEncoder().encode(TestDetail.QueryData(version: 0)),
+            key: stored, type: String(reflecting: TestDetail.self),
+            stateData: try JSONEncoder().encode(TestDetail.QueryData(version: 0)),
             lastSyncedAt: .now, tags: QueryRecord.Tags.encode(["users"])
         ))
         try context.save()
@@ -287,15 +296,15 @@ struct FetcherTests {
         let (provider, _, _) = try makeProvider()
         let context = ModelContext(provider.modelContainer)
         let old = Date.now.addingTimeInterval(-10)
-        context.insert(QueryRecord(key: "Gone.Fetcher:{}", stateData: Data(), lastSyncedAt: old, gcTime: 0))
-        context.insert(QueryRecord(key: String(reflecting: TestDetail.self) + ":{\"renamed\":1}", stateData: Data(), lastSyncedAt: old, gcTime: 0))
-        context.insert(QueryRecord(key: "Gone.Forever:{}", stateData: Data(), lastSyncedAt: old))
+        context.insert(QueryRecord(key: #"["Gone.Fetcher",{}]"#, type: "Gone.Fetcher", stateData: Data(), lastSyncedAt: old, gcTime: 0))
+        context.insert(QueryRecord(key: #"[""# + String(reflecting: TestDetail.self) + #"",{"renamed":1}]"#, type: String(reflecting: TestDetail.self), stateData: Data(), lastSyncedAt: old, gcTime: 0))
+        context.insert(QueryRecord(key: #"["Gone.Forever",{}]"#, type: "Gone.Forever", stateData: Data(), lastSyncedAt: old))
         try context.save()
 
         await provider.collectGarbage()
         let keys = try ModelContext(provider.modelContainer).fetch(FetchDescriptor<QueryRecord>()).map(\.key)
-        #expect(keys.contains("Gone.Forever:{}"))
-        #expect(!keys.contains("Gone.Fetcher:{}"))
+        #expect(keys.contains(#"["Gone.Forever",{}]"#))
+        #expect(!keys.contains(#"["Gone.Fetcher",{}]"#))
         #expect(!keys.contains { $0.contains("renamed") })
     }
 
@@ -307,7 +316,7 @@ struct FetcherTests {
         let key = TestSlowEvict()
         let context = ModelContext(container)
         context.insert(TestProfile(userID: "slow", bio: "old"))
-        context.insert(QueryRecord(key: QueryRecord.Key.make(key), stateData: try JSONEncoder().encode(41), lastSyncedAt: .now))
+        context.insert(QueryRecord(key: QueryRecord.Key.make(key), type: String(reflecting: TestSlowEvict.self), stateData: try JSONEncoder().encode(41), lastSyncedAt: .now))
         try context.save()
 
         let removal = Task { await provider.remove(.type(TestSlowEvict.self)) }
@@ -338,8 +347,8 @@ struct FetcherTests {
         let detail = QueryRecord.Key.make(TestDetail(id: "1"))
         let context = ModelContext(container)
         context.insert(TestProfile(userID: "1", bio: "Ada"))
-        context.insert(QueryRecord(key: detail, stateData: Data("{}".utf8), lastSyncedAt: .now))
-        context.insert(QueryRecord(key: TestNote.queryKey, stateData: Data("{}".utf8), lastSyncedAt: .now))
+        context.insert(QueryRecord(key: detail, type: String(reflecting: TestDetail.self), stateData: Data("{}".utf8), lastSyncedAt: .now))
+        context.insert(QueryRecord(key: TestNote.queryKey, type: TestNote.queryType, stateData: Data("{}".utf8), lastSyncedAt: .now))
         try context.save()
 
         await provider.remove(.all)
@@ -358,7 +367,8 @@ struct FetcherTests {
         let context = ModelContext(provider.modelContainer)
         context.insert(TestProfile(userID: "2", bio: "Grace"))
         context.insert(QueryRecord(
-            key: stored, stateData: try JSONEncoder().encode(TestDetail.QueryData(version: 1)),
+            key: stored, type: String(reflecting: TestDetail.self),
+            stateData: try JSONEncoder().encode(TestDetail.QueryData(version: 1)),
             lastSyncedAt: .now, tags: QueryRecord.Tags.encode(["users"])
         ))
         try context.save()

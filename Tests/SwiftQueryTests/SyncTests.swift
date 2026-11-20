@@ -243,7 +243,7 @@ struct SyncTests {
     func undecodableState() async throws {
         let container = try makeContainer()
         container.mainContext.insert(
-            QueryRecord(key: TestUser.queryKey, stateData: Data("not json".utf8), lastSyncedAt: .now)
+            QueryRecord(key: TestUser.queryKey, type: TestUser.queryType, stateData: Data("not json".utf8), lastSyncedAt: .now)
         )
         try container.mainContext.save()
 
@@ -305,8 +305,8 @@ struct SyncTests {
     func duplicateRecords() async throws {
         let container = try makeContainer()
         let state = try JSONEncoder().encode(TestUser.QueryData(etag: 5))
-        container.mainContext.insert(QueryRecord(key: TestUser.queryKey))
-        container.mainContext.insert(QueryRecord(key: TestUser.queryKey, stateData: state, lastSyncedAt: .now))
+        container.mainContext.insert(QueryRecord(key: TestUser.queryKey, type: TestUser.queryType))
+        container.mainContext.insert(QueryRecord(key: TestUser.queryKey, type: TestUser.queryType, stateData: state, lastSyncedAt: .now))
         try container.mainContext.save()
 
         let (_, client, server) = try makeProvider(container)
@@ -324,9 +324,9 @@ struct SyncTests {
         let container = try makeContainer()
         let encode = { (etag: Int) in try JSONEncoder().encode(TestUser.QueryData(etag: etag)) }
         let context = container.mainContext
-        context.insert(QueryRecord(key: TestUser.queryKey, stateData: try encode(7), lastSyncedAt: .now))
-        context.insert(QueryRecord(key: TestUser.queryKey, stateData: try encode(3), lastSyncedAt: .now - 60))
-        context.insert(QueryRecord(key: TestUser.queryKey))
+        context.insert(QueryRecord(key: TestUser.queryKey, type: TestUser.queryType, stateData: try encode(7), lastSyncedAt: .now))
+        context.insert(QueryRecord(key: TestUser.queryKey, type: TestUser.queryType, stateData: try encode(3), lastSyncedAt: .now - 60))
+        context.insert(QueryRecord(key: TestUser.queryKey, type: TestUser.queryType))
         try context.save()
 
         let (provider, _, server) = try makeProvider(container)

@@ -69,7 +69,7 @@ struct ProviderTests {
         let key = QueryRecord.Key.make(TestDetail(id: "1"))
         let context = ModelContext(container)
         context.insert(TestProfile(userID: "1", bio: "Ada"))
-        context.insert(QueryRecord(key: key, stateData: Data("{}".utf8), lastSyncedAt: .distantPast, gcTime: 0))
+        context.insert(QueryRecord(key: key, type: String(reflecting: TestDetail.self), stateData: Data("{}".utf8), lastSyncedAt: .distantPast, gcTime: 0))
         try context.save()
 
         let (provider, _, _) = try makeProvider(container)
@@ -80,21 +80,23 @@ struct ProviderTests {
         #expect(try fresh.fetch(FetchDescriptor<TestProfile>()).isEmpty)
     }
 
-    @Test("A view's scene going to the background sweeps expired data")
+    @Test("The app going to the background sweeps expired data, with no view showing a key")
     func backgroundSweep() async throws {
-        let (provider, client, _) = try makeProvider()
+        let (provider, _, _) = try makeProvider()
         await provider.waitForGarbageCollection()
         let key = QueryRecord.Key.make(TestDetail(id: "1"))
         let context = ModelContext(provider.modelContainer)
-        context.insert(QueryRecord(key: key, stateData: Data("{}".utf8), lastSyncedAt: .distantPast, gcTime: 0))
+        context.insert(QueryRecord(key: key, type: String(reflecting: TestDetail.self), stateData: Data("{}".utf8), lastSyncedAt: .distantPast, gcTime: 0))
         try context.save()
 
-        let subscription = Subscription<ModelFetcher<TestUser>>()
-        subscription.activate(client, cache: nil, phase: .active) { provider.scheduleGarbageCollection() }
-        subscription.activate(client, cache: nil, phase: .background) { provider.scheduleGarbageCollection() }
-        await provider.waitForGarbageCollection()
-
-        #expect(try ModelContext(provider.modelContainer).fetch(QueryRecord.descriptor(key: key)).isEmpty)
+        // A private center, so other tests' providers aren't swept.
+        let center = NotificationCenter()
+        provider.observeBackground(on: center)
+        center.post(name: QueryProvider.backgroundNotification, object: nil)
+        await eventually {
+            await provider.waitForGarbageCollection()
+            return (try? ModelContext(provider.modelContainer).fetch(QueryRecord.descriptor(key: key)).isEmpty) == true
+        }
     }
 
     @Test("A model's subscription is cancelled after the keep-alive time; the client is kept")
